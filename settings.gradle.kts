@@ -14,5 +14,5 @@ dependencyResolutionManagement {
     }
 }
 
-rootProject.name = "JarvisAccesible"
+rootProject.name = "WallyAccesible"
 include(":app")

@@ -1,4 +1,4 @@
-name: Compilar APK de Jarvis Accesible
+name: Compilar APK de Wally Accesible
 
 on:
   push:
@@ -29,5 +29,5 @@ jobs:
       - name: Subir APK listo para instalar
         uses: actions/upload-artifact@v4
         with:
-          name: JarvisAccesible-APK
+          name: WallyAccesible-APK
           path: app/build/outputs/apk/debug/app-debug.apk

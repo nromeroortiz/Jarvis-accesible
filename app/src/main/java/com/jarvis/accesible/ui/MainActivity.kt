@@ -196,7 +196,7 @@ fun JarvisMainScreen(resumeKey: Int) {
                 else -> "TOCÁ ACÁ PARA HABLAR"
             }
 
-            // MODO TÍO: Botón gigante de extremo a extremo de alto contraste
+            // MODO PRINCIPAL: Botón gigante de extremo a extremo de alto contraste
             Box(
                 modifier = Modifier
                     .fillMaxSize()
@@ -235,7 +235,7 @@ fun JarvisMainScreen(resumeKey: Int) {
                 }
             }
         } else {
-            // MODO CONFIGURACIÓN INICIAL (Para el sobrino)
+            // MODO CONFIGURACIÓN INICIAL
             Column(
                 modifier = Modifier
                     .fillMaxSize()

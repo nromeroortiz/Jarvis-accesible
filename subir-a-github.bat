@@ -1,10 +1,10 @@
 @echo off
 chcp 65001 >nul
-title Actualizar y Compilar Jarvis Accesible en GitHub
+title Actualizar y Compilar Wally Accesible en GitHub
 cd /d "%~dp0"
 
 echo ========================================================
-echo   ACTUALIZAR JARVIS ACCESIBLE EN GITHUB (COMPILADOR APK)
+echo   ACTUALIZAR WALLY ACCESIBLE EN GITHUB (COMPILADOR APK)
 echo ========================================================
 echo.
 
@@ -30,12 +30,12 @@ if "%EXISTING_URL%"=="" (
 echo.
 echo Guardando cambios y subiendo a GitHub...
 git add .
-git commit -m "Fix Android 14/15 ForegroundService startup antes de otorgar permiso de microfono"
+git commit -m "Wally Accesible: actualizacion general, linterna, audios nativos de WhatsApp y mejoras de voz"
 git push -u origin main --force
 
 echo.
 echo ========================================================
 echo   LISTO! Entra a la pestana "Actions" de tu GitHub y
-echo   en 1 minuto descarga el nuevo "JarvisAccesible-APK".
+echo   en 1 minuto descarga el nuevo "WallyAccesible-APK".
 echo ========================================================
 pause
