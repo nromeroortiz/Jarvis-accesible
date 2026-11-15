@@ -306,13 +306,13 @@ object SystemActionsController {
                 val minArr = daily.optJSONArray("temperature_2m_min")
                 val rainArr = daily.optJSONArray("precipitation_probability_max")
 
-                // 1. ¿Pidió los próximos X días o toda la semana?
-                val multiDaysMatch = Regex("(?:proximos|siguientes)\\s+(\\d+)\\s+dias").find(norm)
-                if (multiDaysMatch != null || norm.contains("esta semana") || norm.contains("proximos dias")) {
-                    val count = (multiDaysMatch?.groupValues?.getOrNull(1)?.toIntOrNull() ?: 3).coerceIn(2, 6)
+                // 1. ¿Pidió los próximos X días (con número o palabra: dos, tres, cuatro, cinco...) o toda la semana?
+                val multiDaysCount = parseMultiDaysCount(norm)
+                if (multiDaysCount != null) {
+                    val count = multiDaysCount.coerceIn(2, 6)
                     val sb = StringBuilder()
                     for (i in 1..count.coerceAtMost((maxArr?.length() ?: 1) - 1)) {
-                        val dayName = getDayNameForOffset(i)
+                        val dayName = getDayNameForOffset(i).replaceFirstChar { it.uppercase() }
                         val maxT = maxArr?.optDouble(i, Double.NaN)?.roundToInt() ?: continue
                         val minT = minArr?.optDouble(i, Double.NaN)?.roundToInt() ?: continue
                         val rainP = rainArr?.optInt(i, 0) ?: 0
@@ -393,6 +393,26 @@ object SystemActionsController {
     private fun getDayNameForOffset(daysAhead: Int): String {
         val cal = Calendar.getInstance().apply { add(Calendar.DAY_OF_YEAR, daysAhead) }
         return SimpleDateFormat("EEEE", Locale("es", "AR")).format(cal.time)
+    }
+
+    private fun parseMultiDaysCount(norm: String): Int? {
+        val regex = Regex("(?:proximos|siguientes|estos)\\s+(\\d+|dos|tres|cuatro|cinco|seis|siete)?\\s*dias")
+        val match = regex.find(norm)
+        if (match != null) {
+            val token = match.groupValues.getOrNull(1).orEmpty().trim()
+            return when (token) {
+                "2", "dos" -> 2
+                "3", "tres", "" -> 3
+                "4", "cuatro" -> 4
+                "5", "cinco" -> 5
+                "6", "seis", "7", "siete" -> 6
+                else -> token.toIntOrNull() ?: 3
+            }
+        }
+        if (norm.contains("toda la semana") || norm.contains("esta semana") || norm.contains("proximos dias")) {
+            return 4
+        }
+        return null
     }
 
     private fun parseRequestedDayOfWeek(norm: String): Int? {

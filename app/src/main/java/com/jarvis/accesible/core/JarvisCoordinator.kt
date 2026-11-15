@@ -36,6 +36,7 @@ class JarvisCoordinator private constructor(private val context: Context) {
         private set
 
     private var pendingWhatsAppConfirmation: Pair<String, String>? = null
+    private var pendingDayForContact: String? = null
 
     val speechInput = SpeechInputManager(
         context = context,
@@ -56,6 +57,18 @@ class JarvisCoordinator private constructor(private val context: Context) {
             if (pendingWhatsAppConfirmation != null) {
                 pendingWhatsAppConfirmation = null
                 speaker.speak("Cancelado.")
+            } else if (pendingDayForContact != null) {
+                val contact = pendingDayForContact
+                pendingDayForContact = null
+                if (!contact.isNullOrBlank()) {
+                    WhatsAppRepository.startDayChatPlaybackFromFirstToLast(
+                        context = context,
+                        senderQuery = contact,
+                        dayFilterRaw = "hoy"
+                    ) { text, onDone ->
+                        speaker.speak(text, onFinished = onDone)
+                    }
+                }
             } else {
                 speaker.speak("No te escuché.")
             }
@@ -101,6 +114,22 @@ class JarvisCoordinator private constructor(private val context: Context) {
             return
         }
 
+        // Si había dicho "Abrí el chat de X" y Jarvis le preguntó "¿De qué día querés escuchar?"
+        val contactWaitingDay = pendingDayForContact
+        if (contactWaitingDay != null) {
+            pendingDayForContact = null
+            val norm = WhatsAppRepository.normalizeText(userText)
+            val chosenDay = geminiAgent.extractDayFilterFromCommand(norm) ?: "hoy"
+            WhatsAppRepository.startDayChatPlaybackFromFirstToLast(
+                context = context,
+                senderQuery = contactWaitingDay,
+                dayFilterRaw = chosenDay
+            ) { text, onDone ->
+                speaker.speak(text, onFinished = onDone)
+            }
+            return
+        }
+
         scope.launch {
             isProcessingUiState = true
             val decision = try {
@@ -140,29 +169,34 @@ class JarvisCoordinator private constructor(private val context: Context) {
                     speaker.speak(summary)
                 }
 
-                is AgentDecision.ReadWhatsAppMessagesFiltered -> {
-                    val report = WhatsAppRepository.readMessagesByFilter(
+                is AgentDecision.OpenWhatsAppChatAndAskDay -> {
+                    val displayName = WhatsAppRepository.openContactChatOnly(context, decision.senderName)
+                    pendingDayForContact = displayName
+                    speaker.speak("Chat de $displayName abierto. ¿De qué día querés escuchar?") {
+                        speaker.beepAndVibrate(startListening = true)
+                        mainHandler.postDelayed({
+                            speechInput.startCommandListening()
+                        }, 350L)
+                    }
+                }
+
+                is AgentDecision.StartUnifiedDayChatPlayback -> {
+                    WhatsAppRepository.startDayChatPlaybackFromFirstToLast(
                         context = context,
                         senderQuery = decision.senderName,
-                        dayFilter = decision.dayFilter,
-                        onAsyncScreenRead = { screenText ->
-                            speaker.speak(screenText)
-                        }
-                    )
-                    speaker.speak(report)
+                        dayFilterRaw = decision.dayFilter
+                    ) { text, onDone ->
+                        speaker.speak(text, onFinished = onDone)
+                    }
                 }
 
                 is AgentDecision.PlayWhatsAppVoiceNote -> {
-                    WhatsAppRepository.playWhatsAppVoiceNoteFlexible(
+                    WhatsAppRepository.playSingleRequestedVoiceNote(
                         context = context,
                         senderHint = decision.senderName,
-                        whichOffset = decision.whichOffset,
-                        dayFilter = decision.dayFilter,
-                        forceOpenChat = decision.forceOpenChat
-                    ) { ok, finishMsg ->
-                        if (!ok && finishMsg.isNotBlank()) {
-                            speaker.speak(finishMsg)
-                        }
+                        whichOffsetFromEnd = decision.whichOffset
+                    ) { text, onDone ->
+                        speaker.speak(text, onFinished = onDone)
                     }
                 }
 
@@ -170,13 +204,10 @@ class JarvisCoordinator private constructor(private val context: Context) {
                     WhatsAppRepository.stepActiveQueue(
                         context = context,
                         isNext = decision.isNext,
-                        isRepeat = decision.isRepeat,
-                        onSpeakMessage = { msg ->
-                            if (msg.isNotBlank()) {
-                                speaker.speak(msg)
-                            }
-                        }
-                    )
+                        isRepeat = decision.isRepeat
+                    ) { text, onDone ->
+                        speaker.speak(text, onFinished = onDone)
+                    }
                 }
 
                 is AgentDecision.ProposeWhatsAppTextMessage -> {

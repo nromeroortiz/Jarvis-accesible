@@ -23,15 +23,14 @@ sealed class AgentDecision {
     data class CheckConnectionOnly(val dummy: Boolean = true) : AgentDecision()
     data class CheckWeather(val rawQuery: String) : AgentDecision()
     data class CheckUnreadWhatsApp(val dummy: Boolean = true) : AgentDecision()
-    data class ReadWhatsAppMessagesFiltered(
+    data class OpenWhatsAppChatAndAskDay(val senderName: String) : AgentDecision()
+    data class StartUnifiedDayChatPlayback(
         val senderName: String?,
-        val dayFilter: String?
+        val dayFilter: String
     ) : AgentDecision()
     data class PlayWhatsAppVoiceNote(
         val senderName: String? = null,
-        val whichOffset: Int = 1,
-        val dayFilter: String? = null,
-        val forceOpenChat: Boolean = false
+        val whichOffset: Int = 1
     ) : AgentDecision()
     data class NavigateQueue(
         val isNext: Boolean,
@@ -108,11 +107,9 @@ class GeminiAgent(private val context: Context) {
     }
 
     suspend fun interpretUserCommand(userText: String): AgentDecision = withContext(Dispatchers.IO) {
-        // 1. Intérprete inteligente flexible en español para todas las funciones del teléfono
         val flexibleLocal = tryFlexibleLocalIntent(userText)
         if (flexibleLocal != null) return@withContext flexibleLocal
 
-        // 2. Si hay clave de Gemini válida, intentamos primero con Gemini
         val apiKeys = AppPrefs.getGeminiApiKeyList(context)
         for (key in apiKeys) {
             if (key.startsWith("AIza")) {
@@ -128,7 +125,6 @@ class GeminiAgent(private val context: Context) {
             }
         }
 
-        // 3. Motor de Inteligencia Artificial Gratuito Incorporado (Sin requerir ninguna API Key)
         val builtInAiAnswer = SystemActionsController.askFreeBuiltInAi(userText)
         return@withContext AgentDecision.SpeakOnly(builtInAiAnswer)
     }
@@ -147,11 +143,11 @@ class GeminiAgent(private val context: Context) {
             norm.contains("como te uso")
         ) {
             return AgentDecision.SpeakOnly(
-                "Puedo leer tus mensajes y reproducir tus audios de WhatsApp de hoy o ayer diciendo siguiente y anterior, mandar audios, llamar en altavoz, poner música en YouTube, reconocer qué billete tenés en la mano, decirte la hora, la batería, el clima de cualquier día de la semana, poner alarmas y explicarte recetas paso a paso o responder cualquier pregunta."
+                "Puedo abrir el chat de cualquier contacto y leerte o reproducir tus mensajes y audios del día de hoy o de ayer del primero al último diciendo siguiente y anterior, mandar audios, llamar en altavoz, poner música en YouTube, reconocer qué billete tenés en la mano, decirte la hora, la batería, el clima de cualquier día de la semana, poner alarmas y explicarte recetas paso a paso."
             )
         }
 
-        // 1. Navegación rápida "Siguiente", "Anterior", "Repetir" (para pasar de audio o de mensaje)
+        // 1. Navegación rápida "Siguiente", "Anterior", "Repetir"
         if (norm == "siguiente" ||
             norm == "el siguiente" ||
             norm == "pasa al siguiente" ||
@@ -227,6 +223,8 @@ class GeminiAgent(private val context: Context) {
             norm.contains("hace calor") ||
             norm.contains("como esta el tiempo") ||
             norm.contains("como va a estar el") ||
+            norm.contains("como va a estar los") ||
+            norm.contains("proximos") && norm.contains("dias") ||
             norm.contains("como esta afuera")
         ) {
             return AgentDecision.CheckWeather(rawQuery = rawText)
@@ -297,7 +295,7 @@ class GeminiAgent(private val context: Context) {
             norm.contains("responde")
         val hasAudioWord = norm.contains("audio") || norm.contains("audios") || norm.contains("nota de voz") || norm.contains("mensaje de voz")
 
-        // 10. Grabar y enviar un audio de voz por WhatsApp
+        // 10. Grabar y enviar un audio de voz por WhatsApp ("mandale un audio a Nico")
         if (hasSendOrRecordVerb && hasAudioWord && !norm.contains("reproduci") && !norm.contains("escucha") && !norm.contains("lee")) {
             val contact = extractContactFromCommand(rawText, norm)
             if (!contact.isNullOrBlank()) {
@@ -305,30 +303,7 @@ class GeminiAgent(private val context: Context) {
             }
         }
 
-        // 11. Reproducir Audios de WhatsApp (del día de hoy, de ayer, o de una persona específica)
-        val hasPlayVerb = norm.contains("reproduci") ||
-            norm.contains("escucha") ||
-            norm.contains("pone") ||
-            norm.contains("pasame") ||
-            norm.contains("abri") ||
-            norm.contains("lee")
-
-        if (hasAudioWord && (hasPlayVerb || norm.contains("ultimo") || norm.contains("penultimo") || daySpec != null)) {
-            val whichOffset = when {
-                norm.contains("antepenultimo") || norm.contains("tercer") || norm.contains("ultimos 3") || norm.contains("ultimos tres") -> 3
-                norm.contains("penultimo") || norm.contains("anteultimo") || norm.contains("segundo") || norm.contains("ultimos 2") || norm.contains("ultimos dos") -> 2
-                else -> 1
-            }
-            val sender = extractContactFromCommand(rawText, norm)
-            return AgentDecision.PlayWhatsAppVoiceNote(
-                senderName = sender,
-                whichOffset = whichOffset,
-                dayFilter = daySpec,
-                forceOpenChat = norm.contains("abri") || norm.contains("chat") || !sender.isNullOrBlank()
-            )
-        }
-
-        // 12. Enviar mensaje de texto por WhatsApp
+        // 11. Enviar mensaje de texto por WhatsApp
         val hasTextSendTrigger = (norm.contains("manda") || norm.contains("envia") || norm.contains("escribi") || norm.contains("decile")) &&
             (norm.contains("whatsapp") || norm.contains("mensaje") || norm.contains("que diga"))
 
@@ -339,26 +314,58 @@ class GeminiAgent(private val context: Context) {
             }
         }
 
-        // 13. Leer mensajes de WhatsApp (de hoy, de ayer, ya leídos o nuevos, o de X persona)
-        if (norm.contains("mensaje") ||
+        // 12. "Abrí el chat de X persona" (sin especificar día -> lo abre y pregunta de qué día quiere escuchar)
+        val isOpenChatCommand = (norm.contains("abri") || norm.contains("abrir") || norm.startsWith("chat de ") || norm.startsWith("el chat de ")) &&
+            (norm.contains("chat") || norm.contains("whatsapp") || norm.contains("conversacion"))
+
+        if (isOpenChatCommand) {
+            val contact = extractContactFromCommand(rawText, norm)
+            if (!contact.isNullOrBlank()) {
+                return if (daySpec != null) {
+                    // Si ya dijo el día ("abrí el chat de hoy de Nico"), arranca directo del primero al último de ese día
+                    AgentDecision.StartUnifiedDayChatPlayback(senderName = contact, dayFilter = daySpec)
+                } else {
+                    // Si solo dijo "abrí el chat de Nico", abre el chat y le pregunta de qué día quiere escuchar
+                    AgentDecision.OpenWhatsAppChatAndAskDay(senderName = contact)
+                }
+            }
+        }
+
+        // 13. Leer o reproducir mensajes/audios/chat de un día ("hoy", "ayer", etc.) o de una persona (DEL PRIMERO AL ÚLTIMO sin discriminar texto y audio)
+        val hasPlayOrReadVerb = norm.contains("reproduci") ||
+            norm.contains("escucha") ||
+            norm.contains("pone") ||
+            norm.contains("pasame") ||
+            norm.contains("lee") ||
+            norm.contains("leeme") ||
+            norm.contains("mostrame")
+
+        val mentionsWhatsAppContent = hasAudioWord ||
+            norm.contains("mensaje") ||
             norm.contains("mensajes") ||
+            norm.contains("chat") ||
             norm.contains("whatsapp") ||
             norm.contains("escribio") ||
-            norm.contains("mandaron") ||
-            norm.contains("mando algo") ||
-            norm.contains("llego algo") ||
-            norm.contains("chat de ") ||
-            norm.contains("chat con ")
-        ) {
+            norm.contains("mando")
+
+        if (mentionsWhatsAppContent) {
             val contact = extractContactFromCommand(rawText, norm)
-            // Si especificó una persona ("de Nico") o un día ("de hoy", "de ayer") o dijo "lee los mensajes",
-            // lee todos los de ese filtro aunque ya hayan sido vistos antes.
-            if (!contact.isNullOrBlank() || daySpec != null || norm.contains("lee")) {
-                return AgentDecision.ReadWhatsAppMessagesFiltered(
+
+            // Si pidió específicamente un día ("de hoy", "de ayer") o una persona ("de Nico"):
+            // Recorre la lista unificada (textos + audios) de ese día DEL PRIMERO AL ÚLTIMO
+            if (daySpec != null || !contact.isNullOrBlank() || norm.contains("lee")) {
+                return AgentDecision.StartUnifiedDayChatPlayback(
                     senderName = contact,
-                    dayFilter = daySpec
+                    dayFilter = daySpec ?: "hoy"
                 )
             }
+
+            // Si dijo "reproducí el audio" (en general), arranca la cola de hoy del primero al último
+            if (hasAudioWord && hasPlayOrReadVerb) {
+                return AgentDecision.PlayWhatsAppVoiceNote(senderName = null, whichOffset = 1)
+            }
+
+            // Si solo preguntó "¿tengo mensajes?"
             return AgentDecision.CheckUnreadWhatsApp()
         }
 
@@ -375,7 +382,7 @@ class GeminiAgent(private val context: Context) {
             }
         }
 
-        // 15. YouTube / Música (Cuidado de no capturar frases como "dame el paso a paso...")
+        // 15. YouTube / Música (sin confundirse con recetas ni con chats)
         val isRecipeOrHowTo = norm.contains("paso a paso") || norm.contains("receta") || norm.contains("como hacer") || norm.contains("como se hace")
         if (!isRecipeOrHowTo && (
                 norm.contains("youtube") ||
@@ -397,34 +404,55 @@ class GeminiAgent(private val context: Context) {
         return null
     }
 
-    private fun extractDayFilterFromCommand(normText: String): String? {
+    fun extractDayFilterFromCommand(normText: String): String? {
         return when {
-            normText.contains("ayer") && normText.contains("hoy") -> "hoy y ayer"
             normText.contains("antes de ayer") || normText.contains("anteayer") -> "antes de ayer"
             normText.contains("ayer") -> "ayer"
             normText.contains("hoy") || normText.contains("del dia") -> "hoy"
+            normText.contains("lunes") -> "lunes"
+            normText.contains("martes") -> "martes"
+            normText.contains("miercoles") -> "miercoles"
+            normText.contains("jueves") -> "jueves"
+            normText.contains("viernes") -> "viernes"
+            normText.contains("sabado") -> "sabado"
+            normText.contains("domingo") -> "domingo"
             else -> null
         }
     }
 
     private fun extractContactFromCommand(rawText: String, normText: String): String? {
-        val fromAgenda = WhatsAppRepository.findMentionedContactInSentence(context, rawText)
-        if (!fromAgenda.isNullOrBlank()) return fromAgenda
+        // 1. Limpiamos primero las palabras de fecha ("de hoy", "de ayer", "del día de hoy") para que no tapen el nombre de la persona
+        val withoutDays = normText
+            .replace("del dia de hoy", " ")
+            .replace("del dia de ayer", " ")
+            .replace("de ayer y hoy", " ")
+            .replace("de hoy y ayer", " ")
+            .replace("de antes de ayer", " ")
+            .replace("de hoy", " ")
+            .replace("de ayer", " ")
+            .replace(Regex("\\s+"), " ")
+            .trim()
 
+        // 2. Buscamos primero luego de "de ", "chat de ", "chat con ", "audios de ", "mensajes de "
         val patterns = listOf(
-            Regex("(?:de parte de|chat de|chat con|audios? de|mensajes? de|escribio|mando)\\s+([a-zA-Z0-9áéíóúÁÉÍÓÚñÑ ]+)"),
+            Regex("(?:chat de|chat con|conversacion con|audios? de|mensajes? de|escribio|mando)\\s+([a-zA-Z0-9áéíóúÁÉÍÓÚñÑ ]+)"),
             Regex("(?:llama a|llamar a|comunicame con|hablar con|audio a|audio para|whatsapp a|mensaje a|escribile a|decile a)\\s+([a-zA-Z0-9áéíóúÁÉÍÓÚñÑ ]+)")
         )
         for (regex in patterns) {
-            val match = regex.find(normText)
+            val match = regex.find(withoutDays)
             if (match != null) {
                 val candidate = match.groupValues[1]
-                    .replace(Regex("^\\b(ayer|hoy|dia|el|la|los|las|y|de)\\b\\s*"), "")
+                    .replace(Regex("^\\b(ayer|hoy|dia|el|la|los|las|y|de|persona)\\b\\s*"), "")
                     .replace(Regex("\\b(ayer|hoy|dia|y|que|por|en|el|la|los|las|un|una|ultimo|penultimo|anterior|antepenultimo|reproduci|escuchar|audio|audios|whatsapp)\\b.*"), "")
                     .trim()
                 if (candidate.length >= 2) return candidate
             }
         }
+
+        // 3. También verificamos si aparece algún contacto de la agenda del teléfono en la oración
+        val fromAgenda = WhatsAppRepository.findMentionedContactInSentence(context, rawText)
+        if (!fromAgenda.isNullOrBlank()) return fromAgenda
+
         return null
     }
 
