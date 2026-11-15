@@ -103,6 +103,9 @@ class GeminiAgent(private val context: Context) {
         }
     }
 
+    suspend fun analyzeArgentineBanknote(jpegBytes: ByteArray): String? =
+        identifyArgentineBanknoteFromJpeg(jpegBytes)
+
     suspend fun identifyArgentineBanknoteFromJpeg(jpegBytes: ByteArray): String? = withContext(Dispatchers.IO) {
         val keys = AppPrefs.getGeminiApiKeyList(context)
         if (keys.isEmpty()) return@withContext null

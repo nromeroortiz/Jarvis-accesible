@@ -162,6 +162,30 @@ object WhatsAppRepository {
         }
     }
 
+    fun addIncomingNotification(
+        context: Context,
+        sender: String,
+        text: String,
+        replyIntent: PendingIntent?,
+        remoteInputs: Array<RemoteInput>?
+    ) {
+        val lower = text.lowercase()
+        val isVoiceNote = lower.contains("mensaje de voz") ||
+            lower.contains("nota de voz") ||
+            lower.contains("audio") ||
+            text.contains("🎤") ||
+            text.contains("🎵")
+        onNewNotificationMessage(
+            context = context,
+            id = "${sender}_${System.currentTimeMillis()}",
+            sender = sender,
+            text = text,
+            isVoiceNote = isVoiceNote,
+            replyIntent = replyIntent,
+            remoteInputs = remoteInputs
+        )
+    }
+
     fun onNewNotificationMessage(
         context: Context,
         id: String,
