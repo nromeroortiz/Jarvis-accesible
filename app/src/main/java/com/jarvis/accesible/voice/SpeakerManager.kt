@@ -59,29 +59,35 @@ class SpeakerManager(private val context: Context) : TextToSpeech.OnInitListener
                 }
 
                 override fun onDone(utteranceId: String?) {
-                    isSpeakingNow = false
-                    abandonAudioFocus()
-                    if (utteranceId != null) {
-                        val callback = pendingCallbacks.remove(utteranceId)
-                        if (callback != null) {
-                            mainHandler.post { callback.invoke() }
-                        }
-                    }
+                    completeUtterance(utteranceId)
                 }
 
                 @Deprecated("Deprecated in Java")
                 override fun onError(utteranceId: String?) {
-                    isSpeakingNow = false
-                    abandonAudioFocus()
-                    if (utteranceId != null) {
-                        val callback = pendingCallbacks.remove(utteranceId)
-                        if (callback != null) {
-                            mainHandler.post { callback.invoke() }
-                        }
+                    completeUtterance(utteranceId)
+                }
+
+                override fun onStop(utteranceId: String?, interrupted: Boolean) {
+                    if (!interrupted) {
+                        completeUtterance(utteranceId)
+                    } else {
+                        isSpeakingNow = false
+                        abandonAudioFocus()
                     }
                 }
             })
             isReady = true
+        }
+    }
+
+    private fun completeUtterance(utteranceId: String?) {
+        isSpeakingNow = false
+        abandonAudioFocus()
+        if (utteranceId != null) {
+            val callback = pendingCallbacks.remove(utteranceId)
+            if (callback != null) {
+                mainHandler.post { callback.invoke() }
+            }
         }
     }
 
@@ -102,12 +108,23 @@ class SpeakerManager(private val context: Context) : TextToSpeech.OnInitListener
             return
         }
 
+        if (flush) {
+            pendingCallbacks.clear()
+        }
+
         requestAudioFocus()
         tts?.setSpeechRate(AppPrefs.getSpeechRate(context))
 
         val utteranceId = UUID.randomUUID().toString()
         if (onFinished != null) {
             pendingCallbacks[utteranceId] = onFinished
+            // Respaldo de seguridad por si el motor TTS de Android pierde el evento onDone al cambiar de ventana a WhatsApp
+            val estimatedMs = (cleanText.length * 85L).coerceIn(2200L, 35000L) + 1500L
+            mainHandler.postDelayed({
+                if (pendingCallbacks.containsKey(utteranceId) && !(tts?.isSpeaking ?: false)) {
+                    completeUtterance(utteranceId)
+                }
+            }, estimatedMs)
         }
 
         val queueMode = if (flush) TextToSpeech.QUEUE_FLUSH else TextToSpeech.QUEUE_ADD
@@ -115,7 +132,10 @@ class SpeakerManager(private val context: Context) : TextToSpeech.OnInitListener
             putFloat(TextToSpeech.Engine.KEY_PARAM_VOLUME, 1.0f)
         }
         isSpeakingNow = true
-        tts?.speak(cleanText, queueMode, params, utteranceId)
+        val res = tts?.speak(cleanText, queueMode, params, utteranceId) ?: TextToSpeech.ERROR
+        if (res == TextToSpeech.ERROR) {
+            completeUtterance(utteranceId)
+        }
     }
 
     fun stopSpeaking() {

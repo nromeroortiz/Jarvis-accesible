@@ -15,14 +15,15 @@ import com.jarvis.accesible.core.AppPrefs
 
 /**
  * Gestiona tanto la escucha de comandos manos libres (sin tener que mantener apretado ningún botón)
- * como el modo opcional de escucha continua por palabra de activación ("Jarvis" / "Asistente").
+ * como el modo opcional de activación por voz diciendo explícitamente "Jarvis" / "Hola Jarvis".
  */
 class SpeechInputManager(
     private val context: Context,
     private val onCommandRecognized: (String) -> Unit,
     private val onWakeWordDetected: (String?) -> Unit,
     private val onListeningError: (Int) -> Unit,
-    private val onListeningStateChanged: ((Boolean) -> Unit)? = null
+    private val onListeningStateChanged: ((Boolean) -> Unit)? = null,
+    private val isBusySpeakingOrPlaying: (() -> Boolean)? = null
 ) {
     private val mainHandler = Handler(Looper.getMainLooper())
     private var speechRecognizer: SpeechRecognizer? = null
@@ -87,7 +88,6 @@ class SpeechInputManager(
                     override fun onError(error: Int) {
                         val elapsed = System.currentTimeMillis() - startTimestamp
 
-                        // Si ya habíamos capturado texto parcial mientras hablaba y al final tiró timeout/no_match, usamos lo escuchado
                         if (lastPartialText.isNotEmpty()) {
                             isActivelyListeningCommand = false
                             onListeningStateChanged?.invoke(false)
@@ -98,9 +98,7 @@ class SpeechInputManager(
                             return
                         }
 
-                        // Si el reconocedor dio un error instantáneo al abrir (<1.5s, ej. ERROR_CLIENT o ERROR_RECOGNIZER_BUSY),
-                        // reintentamos automáticamente una vez tras 350ms sin molestar al usuario diciendo "No llegué a escucharte".
-                        if (!hasRetried && elapsed < 1500L) {
+                        if (!hasRetried && elapsed < 1400L) {
                             mainHandler.postDelayed({
                                 startCommandListeningInternal(hasRetried = true)
                             }, 350L)
@@ -132,8 +130,6 @@ class SpeechInputManager(
                 })
             }
 
-            // Intent limpio y compatible con todos los teléfonos Android 10 a 15
-            // (sin EXTRA_SPEECH_INPUT_*_SILENCE_LENGTH_MILLIS que en Google Speech Services moderno corta la escucha al instante)
             val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
                 putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
                 putExtra(RecognizerIntent.EXTRA_LANGUAGE, "es-AR")
@@ -178,12 +174,19 @@ class SpeechInputManager(
             if (AppPrefs.isWakeWordEnabled(context) && !isActivelyListeningCommand) {
                 startWakeWordSingleCycle()
             }
-        }, 1200L)
+        }, 1800L)
     }
 
     private fun startWakeWordSingleCycle() {
         if (isActivelyListeningCommand || !AppPrefs.isWakeWordEnabled(context)) return
         if (ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) return
+
+        // Si Jarvis está hablando o reproduciendo un audio, esperamos sin prender el micrófono ambiental
+        if (isBusySpeakingOrPlaying?.invoke() == true) {
+            mainHandler.postDelayed({ startWakeWordSingleCycle() }, 2000L)
+            return
+        }
+
         isWakeWordLoopActive = true
         destroyRecognizer()
 
@@ -206,20 +209,20 @@ class SpeechInputManager(
                 override fun onResults(results: Bundle?) {
                     val matches = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
                     val heard = matches?.firstOrNull()?.lowercase()?.trim() ?: ""
-                    val wakeWord = AppPrefs.getWakeWordPhrase(context)
+                    val customWake = AppPrefs.getWakeWordPhrase(context).lowercase().trim()
 
-                    if (heard.contains(wakeWord) || heard.contains("jarvis") || heard.contains("asistente")) {
-                        val remaining = heard
-                            .replace("hola $wakeWord", "")
-                            .replace("hola jarvis", "")
-                            .replace("hola asistente", "")
-                            .replace(wakeWord, "")
-                            .replace("jarvis", "")
-                            .replace("asistente", "")
-                            .trim()
-                        onWakeWordDetected(remaining.ifEmpty { null })
+                    // Solo activamos si la oración empieza explícitamente llamando a "Jarvis" (ej. "Jarvis", "Hola Jarvis", "Che Jarvis")
+                    // Ignoramos charlas del entorno o televisión donde no se lo llamó al principio.
+                    val wakeRegex = Regex(
+                        "^(?:hola\\s+|che\\s+|ok\\s+|hey\\s+|buen dia\\s+)?(?:jarvis|sharvis|yarvis|charvis|${Regex.escape(customWake)})(?:\\b|[\\s,.:;!?]+)(.*)$",
+                        RegexOption.IGNORE_CASE
+                    )
+                    val match = wakeRegex.find(heard)
+                    if (match != null) {
+                        val commandAfterWakeWord = match.groupValues.getOrNull(1)?.trim().orEmpty()
+                        onWakeWordDetected(commandAfterWakeWord.ifEmpty { null })
                     } else if (AppPrefs.isWakeWordEnabled(context) && !isActivelyListeningCommand) {
-                        mainHandler.postDelayed({ startWakeWordSingleCycle() }, 800L)
+                        mainHandler.postDelayed({ startWakeWordSingleCycle() }, 900L)
                     }
                 }
 
@@ -231,7 +234,7 @@ class SpeechInputManager(
         val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
             putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
             putExtra(RecognizerIntent.EXTRA_LANGUAGE, "es-AR")
-            putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
+            putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, false)
             putExtra(RecognizerIntent.EXTRA_CALLING_PACKAGE, context.packageName)
         }
 

@@ -97,146 +97,203 @@ class GeminiAgent(private val context: Context) {
                     }
                 }
             }
-            Pair(
-                true,
-                "🟢 IA Gratuita Incorporada activa (la clave ingresada no es de AI Studio, pero ya tenés la IA integrada funcionando sin clave)."
-            )
+            Pair(true, "🟢 Modo IA Gratuita Automática activo (respaldo sin clave listo).")
         } catch (e: Exception) {
-            Pair(true, "🟢 IA Gratuita Incorporada activa.")
+            Pair(false, "❌ Sin conexión a internet.")
         }
     }
 
-    suspend fun interpretUserCommand(userText: String): AgentDecision = withContext(Dispatchers.IO) {
-        val flexibleLocal = tryFlexibleLocalIntent(userText)
-        if (flexibleLocal != null) return@withContext flexibleLocal
+    suspend fun identifyArgentineBanknoteFromJpeg(jpegBytes: ByteArray): String? = withContext(Dispatchers.IO) {
+        val keys = AppPrefs.getGeminiApiKeyList(context)
+        if (keys.isEmpty()) return@withContext null
 
-        val apiKeys = AppPrefs.getGeminiApiKeyList(context)
-        for (key in apiKeys) {
-            if (key.startsWith("AIza")) {
+        val base64Image = Base64.encodeToString(jpegBytes, Base64.NO_WRAP)
+        val prompt = """
+            Mirá esta foto tomada por una persona ciega en Argentina y decime qué billete de pesos argentinos es.
+            Respondé ÚNICAMENTE con una frase muy corta como: "Es de 1000", "Es de 2000", "Es de 10000", "Es de 20000", "Es de 500", "Es de 200", "Es de 100".
+            Si no se llega a ver el número, respondé: "No se ve bien, dalo vuelta".
+        """.trimIndent()
+
+        val payload = JSONObject().apply {
+            put("contents", JSONArray().put(JSONObject().apply {
+                put("role", "user")
+                put("parts", JSONArray()
+                    .put(JSONObject().put("text", prompt))
+                    .put(JSONObject().apply {
+                        put("inline_data", JSONObject().apply {
+                            put("mime_type", "image/jpeg")
+                            put("data", base64Image)
+                        })
+                    })
+                )
+            }))
+        }
+
+        for (apiKey in keys) {
+            for (model in candidateModels) {
                 try {
-                    val result = callGeminiWithTools(key, userText)
-                    if (result != null) {
-                        if (result !is AgentDecision.SpeakOnly || !result.message.startsWith("CUOTA_AGOTADA")) {
-                            return@withContext result
+                    val url = "https://generativelanguage.googleapis.com/v1beta/models/$model:generateContent?key=$apiKey"
+                    val request = Request.Builder()
+                        .url(url)
+                        .header("x-goog-api-key", apiKey)
+                        .post(payload.toString().toRequestBody("application/json; charset=utf-8".toMediaType()))
+                        .build()
+
+                    client.newCall(request).execute().use { response ->
+                        if (response.isSuccessful) {
+                            val bodyStr = response.body?.string().orEmpty()
+                            val json = JSONObject(bodyStr)
+                            val text = json.optJSONArray("candidates")
+                                ?.optJSONObject(0)
+                                ?.optJSONObject("content")
+                                ?.optJSONArray("parts")
+                                ?.optJSONObject(0)
+                                ?.optString("text", "")
+                                ?.trim()
+                            if (!text.isNullOrBlank()) {
+                                return@withContext text
+                            }
                         }
                     }
                 } catch (_: Exception) {
                 }
             }
         }
+        return@withContext null
+    }
 
-        val builtInAiAnswer = SystemActionsController.askFreeBuiltInAi(userText)
-        return@withContext AgentDecision.SpeakOnly(builtInAiAnswer)
+    suspend fun interpretUserCommand(userText: String): AgentDecision = withContext(Dispatchers.IO) {
+        val localMatch = tryFlexibleLocalIntent(userText)
+        if (localMatch != null) {
+            return@withContext localMatch
+        }
+
+        val apiKeys = AppPrefs.getGeminiApiKeyList(context)
+        if (apiKeys.isNotEmpty()) {
+            for (apiKey in apiKeys) {
+                try {
+                    val decision = callGeminiWithTools(apiKey, userText)
+                    if (decision != null && (decision !is AgentDecision.SpeakOnly || decision.message != "CUOTA_AGOTADA")) {
+                        return@withContext decision
+                    }
+                } catch (_: Exception) {
+                }
+            }
+        }
+
+        val aiAnswer = SystemActionsController.askFreeBuiltInAi(userText)
+        return@withContext AgentDecision.SpeakOnly(aiAnswer)
     }
 
     private fun tryFlexibleLocalIntent(rawText: String): AgentDecision? {
         val norm = WhatsAppRepository.normalizeText(rawText)
-        if (norm.isBlank()) return null
 
-        // 0. "¿Qué podés hacer?" / "Enlistame las cosas que podés hacer" / "Ayuda"
+        // 0. ¿Qué podés hacer? / Ayuda
         if (norm.contains("que podes hacer") ||
-            norm.contains("cosas que podes hacer") ||
+            norm.contains("que puedes hacer") ||
+            norm.contains("que sabes hacer") ||
             norm.contains("enlistame") ||
-            norm.contains("que funciones tenes") ||
+            norm.contains("lista de comandos") ||
             norm.contains("para que servis") ||
-            norm == "ayuda" ||
-            norm.contains("como te uso")
+            norm == "ayuda"
         ) {
             return AgentDecision.SpeakOnly(
-                "Puedo abrir el chat de cualquier contacto y leerte o reproducir tus mensajes y audios del día de hoy o de ayer del primero al último diciendo siguiente y anterior, mandar audios, llamar en altavoz, poner música en YouTube, reconocer qué billete tenés en la mano, decirte la hora, la batería, el clima de cualquier día de la semana, poner alarmas y explicarte recetas paso a paso."
+                "Puedo leer tus mensajes y audios de WhatsApp por día diciendo por ejemplo abrí el chat de Nico o leeme los mensajes de ayer, " +
+                    "contestar grabando un audio, llamar en altavoz, decirte la hora, la batería, el clima de toda la semana, " +
+                    "reconocer billetes con la cámara, poner música en YouTube y explicarte recetas paso a paso."
             )
         }
 
-        // 1. Navegación rápida "Siguiente", "Anterior", "Repetir"
+        // 1. Navegación rápida ("siguiente", "anterior", "repetir", "otro") en la cola activa de WhatsApp
         if (norm == "siguiente" ||
             norm == "el siguiente" ||
-            norm == "pasa al siguiente" ||
-            norm == "el que sigue" ||
+            norm == "proximo" ||
+            norm == "el proximo" ||
             norm == "otro" ||
-            norm == "el otro" ||
-            norm == "siguiente audio" ||
-            norm == "siguiente mensaje"
+            norm == "el que sigue" ||
+            norm == "pasa al siguiente" ||
+            norm == "siguiente mensaje" ||
+            norm == "siguiente audio"
         ) {
             return AgentDecision.NavigateQueue(isNext = true, isRepeat = false)
         }
 
         if (norm == "anterior" ||
             norm == "el anterior" ||
-            norm == "volve al anterior" ||
             norm == "atras" ||
-            norm == "el de antes" ||
-            norm == "audio anterior" ||
-            norm == "mensaje anterior"
+            norm == "volver" ||
+            norm == "mensaje anterior" ||
+            norm == "audio anterior"
         ) {
             return AgentDecision.NavigateQueue(isNext = false, isRepeat = false)
         }
 
-        if (norm == "repetilo" ||
+        if (norm == "repeti" ||
             norm == "repetir" ||
             norm == "de nuevo" ||
             norm == "otra vez" ||
-            norm == "el mismo"
+            norm == "repetilo"
         ) {
             return AgentDecision.NavigateQueue(isNext = false, isRepeat = true)
         }
 
-        // 2. Callar / Detener / Pausar música o alarma
+        // 2. Reconocimiento de billetes
+        if (norm.contains("billete") ||
+            norm.contains("cuanta plata") ||
+            norm.contains("cuanto es este") ||
+            norm.contains("que valor tiene") ||
+            norm.contains("de cuanto es")
+        ) {
+            return AgentDecision.IdentifyBanknote()
+        }
+
+        // 3. Parar / Silenciar / Cortar llamada
         if (norm == "para" ||
             norm == "basta" ||
             norm == "silencio" ||
             norm == "callate" ||
-            norm == "pausa" ||
-            norm == "cortala" ||
+            norm.contains("pausa") ||
+            norm.contains("detene") ||
             norm.contains("apaga la musica") ||
-            norm.contains("detene la musica") ||
-            norm.contains("para la musica") ||
-            norm.contains("saca la musica") ||
-            norm.contains("pausa youtube") ||
-            norm.contains("apaga youtube") ||
             norm.contains("apaga la alarma")
         ) {
             return AgentDecision.StopPlaybackOrAlarm()
         }
 
-        // 3. Reconocer Billetes por Cámara
-        if (norm.contains("billete") ||
-            norm.contains("billetes") ||
-            norm.contains("cuanta plata") ||
-            norm.contains("que plata") ||
-            norm.contains("cuantos pesos") ||
-            norm.contains("de cuanto es este") ||
-            norm.contains("de cuanto es esto") ||
-            norm.contains("cuanto vale este")
-        ) {
-            return AgentDecision.IdentifyBanknote()
+        if (norm.contains("corta la llamada") || norm.contains("colga") || norm.contains("cortar llamada")) {
+            return AgentDecision.EndOrAnswerCall(endCall = true)
+        }
+        if (norm.contains("atende") || norm.contains("atender llamada") || norm.contains("contesta la llamada")) {
+            return AgentDecision.EndOrAnswerCall(endCall = false)
         }
 
-        // 4. Clima / Temperatura / Pronóstico (hoy, mañana, el lunes, los próximos X días, etc.)
-        if (norm.contains("clima") ||
-            norm.contains("grados") ||
+        // 4. Clima / Temperatura / Pronóstico (hoy, mañana, lunes..domingo, próximos X días)
+        val hasWeatherKeyword = norm.contains("clima") ||
             norm.contains("temperatura") ||
-            norm.contains("pronostico") ||
-            norm.contains("llover") ||
-            norm.contains("llueve") ||
-            norm.contains("lluvia") ||
+            norm.contains("cuantos grados") ||
             norm.contains("hace frio") ||
             norm.contains("hace calor") ||
-            norm.contains("como esta el tiempo") ||
-            norm.contains("como va a estar el") ||
-            norm.contains("como va a estar los") ||
-            norm.contains("proximos") && norm.contains("dias") ||
-            norm.contains("como esta afuera")
-        ) {
-            return AgentDecision.CheckWeather(rawQuery = rawText)
+            norm.contains("va a llover") ||
+            norm.contains("llueve") ||
+            norm.contains("pronostico") ||
+            norm.contains("tiempo")
+
+        val hasMultiDaysPhrase = norm.contains("proximos") && norm.contains("dias") ||
+            norm.contains("siguientes") && norm.contains("dias")
+
+        val hasHowWillItBe = (norm.contains("como va a estar") || norm.contains("como estara")) &&
+            !norm.contains("mensaje") && !norm.contains("whatsapp") && !norm.contains("audio") && !norm.contains("chat")
+
+        if (hasWeatherKeyword || hasMultiDaysPhrase || hasHowWillItBe) {
+            return AgentDecision.CheckWeather(rawText)
         }
 
         // 5. Hora sola
-        val isAlarmRequest = norm.contains("alarma") || norm.contains("desperta")
+        val isAlarmRequest = norm.contains("alarma") || norm.contains("despertador") || norm.contains("despertame")
         if (!isAlarmRequest && (
                 norm.contains("que hora") ||
                     norm.contains("decime la hora") ||
-                    norm.contains("tenes hora") ||
-                    norm.contains("hora actual") ||
+                    norm.contains("dime la hora") ||
                     norm == "la hora" ||
                     norm == "hora"
                 )
@@ -289,29 +346,26 @@ class GeminiAgent(private val context: Context) {
         }
 
         val daySpec = extractDayFilterFromCommand(norm)
-        val hasSendOrRecordVerb = norm.contains("manda") ||
-            norm.contains("envia") ||
-            norm.contains("graba") ||
-            norm.contains("responde")
         val hasAudioWord = norm.contains("audio") || norm.contains("audios") || norm.contains("nota de voz") || norm.contains("mensaje de voz")
 
-        // 10. Grabar y enviar un audio de voz por WhatsApp ("mandale un audio a Nico")
-        if (hasSendOrRecordVerb && hasAudioWord && !norm.contains("reproduci") && !norm.contains("escucha") && !norm.contains("lee")) {
-            val contact = extractContactFromCommand(rawText, norm)
-            if (!contact.isNullOrBlank()) {
-                return AgentDecision.StartWhatsAppVoiceNoteRecording(contact)
-            }
-        }
-
-        // 11. Enviar mensaje de texto por WhatsApp
-        val hasTextSendTrigger = (norm.contains("manda") || norm.contains("envia") || norm.contains("escribi") || norm.contains("decile")) &&
-            (norm.contains("whatsapp") || norm.contains("mensaje") || norm.contains("que diga"))
-
-        if (hasTextSendTrigger && !hasAudioWord) {
+        // 10. Si dictó un mensaje de texto explícito con "que diga ..." ("mandale un mensaje a Nico que diga hola")
+        if (!hasAudioWord && (norm.contains("que diga") || norm.contains("diciendo"))) {
             val parsed = parseWhatsAppTextCommand(rawText)
             if (parsed != null) {
                 return AgentDecision.ProposeWhatsAppTextMessage(parsed.first, parsed.second)
             }
+        }
+
+        // 11. Responder / Contestar / Mandar audio por WhatsApp ("contestale a X", "respondele a X", "contestale", "mandale un audio a X")
+        // Por defecto empieza a grabar un audio directamente después del pitido y lo envía al terminar de hablar
+        val isReplyOrRecordCommand = norm.contains("contesta") ||
+            norm.contains("responde") ||
+            norm.contains("graba") ||
+            ((norm.contains("manda") || norm.contains("envia")) && (hasAudioWord || norm.contains("mensaje") || norm.contains("whatsapp")))
+
+        if (isReplyOrRecordCommand && !norm.contains("reproduci") && !norm.contains("escucha") && !norm.contains("lee")) {
+            val contact = extractContactFromCommand(rawText, norm) ?: WhatsAppRepository.lastOpenedContactName.orEmpty()
+            return AgentDecision.StartWhatsAppVoiceNoteRecording(contact)
         }
 
         // 12. "Abrí el chat de X persona" (sin especificar día -> lo abre y pregunta de qué día quiere escuchar)
@@ -322,16 +376,24 @@ class GeminiAgent(private val context: Context) {
             val contact = extractContactFromCommand(rawText, norm)
             if (!contact.isNullOrBlank()) {
                 return if (daySpec != null) {
-                    // Si ya dijo el día ("abrí el chat de hoy de Nico"), arranca directo del primero al último de ese día
                     AgentDecision.StartUnifiedDayChatPlayback(senderName = contact, dayFilter = daySpec)
                 } else {
-                    // Si solo dijo "abrí el chat de Nico", abre el chat y le pregunta de qué día quiere escuchar
                     AgentDecision.OpenWhatsAppChatAndAskDay(senderName = contact)
                 }
             }
         }
 
-        // 13. Leer o reproducir mensajes/audios/chat de un día ("hoy", "ayer", etc.) o de una persona (DEL PRIMERO AL ÚLTIMO sin discriminar texto y audio)
+        // 13. Si el usuario solo dijo el día ("los de hoy", "de ayer", "del viernes") teniendo ya un chat abierto/reciente
+        if (daySpec != null && !WhatsAppRepository.lastOpenedContactName.isNullOrBlank() &&
+            (norm.startsWith("de ") || norm.startsWith("del ") || norm.startsWith("los de ") || norm.startsWith("el ") || norm == daySpec)
+        ) {
+            return AgentDecision.StartUnifiedDayChatPlayback(
+                senderName = WhatsAppRepository.lastOpenedContactName,
+                dayFilter = daySpec
+            )
+        }
+
+        // 14. Leer o reproducir mensajes/audios/chat de un día ("hoy", "ayer", "viernes", etc.) o de una persona (DEL PRIMERO AL ÚLTIMO)
         val hasPlayOrReadVerb = norm.contains("reproduci") ||
             norm.contains("escucha") ||
             norm.contains("pone") ||
@@ -349,10 +411,15 @@ class GeminiAgent(private val context: Context) {
             norm.contains("mando")
 
         if (mentionsWhatsAppContent) {
+            // Si preguntó en general "¿tengo mensajes?" / "¿hay mensajes nuevos?" sin pedir de un día ni de una persona
+            val isGeneralUnreadCheck = (norm.contains("tengo mensaje") || norm.contains("hay mensaje") || norm.contains("quien me escribio") || norm.contains("mensajes nuevos")) &&
+                daySpec == null && !norm.contains("lee") && !norm.contains("reproduci")
+            if (isGeneralUnreadCheck) {
+                return AgentDecision.CheckUnreadWhatsApp()
+            }
+
             val contact = extractContactFromCommand(rawText, norm)
 
-            // Si pidió específicamente un día ("de hoy", "de ayer") o una persona ("de Nico"):
-            // Recorre la lista unificada (textos + audios) de ese día DEL PRIMERO AL ÚLTIMO
             if (daySpec != null || !contact.isNullOrBlank() || norm.contains("lee")) {
                 return AgentDecision.StartUnifiedDayChatPlayback(
                     senderName = contact,
@@ -360,16 +427,14 @@ class GeminiAgent(private val context: Context) {
                 )
             }
 
-            // Si dijo "reproducí el audio" (en general), arranca la cola de hoy del primero al último
             if (hasAudioWord && hasPlayOrReadVerb) {
                 return AgentDecision.PlayWhatsAppVoiceNote(senderName = null, whichOffset = 1)
             }
 
-            // Si solo preguntó "¿tengo mensajes?"
             return AgentDecision.CheckUnreadWhatsApp()
         }
 
-        // 14. Llamadas Telefónicas
+        // 15. Llamadas Telefónicas
         if (norm.contains("llama ") ||
             norm.startsWith("llama") ||
             norm.contains("llamar ") ||
@@ -382,8 +447,13 @@ class GeminiAgent(private val context: Context) {
             }
         }
 
-        // 15. YouTube / Música (sin confundirse con recetas ni con chats)
-        val isRecipeOrHowTo = norm.contains("paso a paso") || norm.contains("receta") || norm.contains("como hacer") || norm.contains("como se hace")
+        // 16. YouTube / Música (sin confundirse con recetas ni con chats)
+        val isRecipeOrHowTo = norm.contains("paso a paso") ||
+            norm.contains("receta") ||
+            norm.contains("como hacer") ||
+            norm.contains("como hago") ||
+            norm.contains("como se hace") ||
+            norm.contains("como preparar")
         if (!isRecipeOrHowTo && (
                 norm.contains("youtube") ||
                     norm.contains("musica") ||
@@ -421,44 +491,48 @@ class GeminiAgent(private val context: Context) {
     }
 
     private fun extractContactFromCommand(rawText: String, normText: String): String? {
-        // 1. Limpiamos primero las palabras de fecha ("de hoy", "de ayer", "del día de hoy") para que no tapen el nombre de la persona
+        // 1. Limpiamos primero todas las frases de fecha ("de hoy", "de ayer", "del viernes", etc.) para que no tapen el nombre
         val withoutDays = normText
             .replace("del dia de hoy", " ")
             .replace("del dia de ayer", " ")
             .replace("de ayer y hoy", " ")
             .replace("de hoy y ayer", " ")
             .replace("de antes de ayer", " ")
+            .replace("de anteayer", " ")
             .replace("de hoy", " ")
             .replace("de ayer", " ")
+            .replace(Regex("\\b(?:del|de)\\s+(?:lunes|martes|miercoles|jueves|viernes|sabado|domingo)\\b"), " ")
             .replace(Regex("\\s+"), " ")
             .trim()
 
-        // 2. Buscamos primero luego de "de ", "chat de ", "chat con ", "audios de ", "mensajes de "
+        // 2. Primero probamos coincidencia fonética directa con la agenda del teléfono (ej. "Dayana UNLa" -> "Daiana UNLa")
+        val fromAgenda = WhatsAppRepository.findMentionedContactInSentence(context, rawText)
+        if (!fromAgenda.isNullOrBlank()) return fromAgenda
+
+        // 3. Extraemos el nombre luego de verbos/preposiciones de chat, respuesta, envío de audio o llamada
         val patterns = listOf(
+            Regex("(?:enviale|enviarle|envia|enviar|mandale|mandar|manda|grabale|grabar|graba)\\s+(?:un\\s+)?(?:audio|mensaje de voz|nota de voz|mensaje|whatsapp)\\s+(?:a|para)\\s+([a-zA-Z0-9áéíóúÁÉÍÓÚñÑ ]+)"),
+            Regex("(?:contestale a|contestar a|respondele a|responder a|enviale a|enviarle a|mandale a|grabale a|grabar audio para|audio a|audio para|mensaje a|mensaje para|whatsapp a|escribile a|decile a)\\s+([a-zA-Z0-9áéíóúÁÉÍÓÚñÑ ]+)"),
             Regex("(?:chat de|chat con|conversacion con|audios? de|mensajes? de|escribio|mando)\\s+([a-zA-Z0-9áéíóúÁÉÍÓÚñÑ ]+)"),
-            Regex("(?:llama a|llamar a|comunicame con|hablar con|audio a|audio para|whatsapp a|mensaje a|escribile a|decile a)\\s+([a-zA-Z0-9áéíóúÁÉÍÓÚñÑ ]+)")
+            Regex("(?:llama a|llamar a|comunicame con|hablar con)\\s+([a-zA-Z0-9áéíóúÁÉÍÓÚñÑ ]+)")
         )
         for (regex in patterns) {
             val match = regex.find(withoutDays)
             if (match != null) {
                 val candidate = match.groupValues[1]
-                    .replace(Regex("^\\b(ayer|hoy|dia|el|la|los|las|y|de|persona)\\b\\s*"), "")
-                    .replace(Regex("\\b(ayer|hoy|dia|y|que|por|en|el|la|los|las|un|una|ultimo|penultimo|anterior|antepenultimo|reproduci|escuchar|audio|audios|whatsapp)\\b.*"), "")
+                    .replace(Regex("^\\b(ayer|hoy|lunes|martes|miercoles|jueves|viernes|sabado|domingo|dia|el|la|los|las|y|de|persona)\\b\\s*"), "")
+                    .replace(Regex("\\b(ayer|hoy|lunes|martes|miercoles|jueves|viernes|sabado|domingo|dia|que|por|en|un|una|ultimo|penultimo|anterior|reproduci|escuchar|audio|audios|whatsapp)\\b.*"), "")
                     .trim()
                 if (candidate.length >= 2) return candidate
             }
         }
-
-        // 3. También verificamos si aparece algún contacto de la agenda del teléfono en la oración
-        val fromAgenda = WhatsAppRepository.findMentionedContactInSentence(context, rawText)
-        if (!fromAgenda.isNullOrBlank()) return fromAgenda
 
         return null
     }
 
     private fun parseWhatsAppTextCommand(rawText: String): Pair<String, String>? {
         val regex = Regex(
-            "(?:mandale|manda|enviale|enviar|escribile|decile)\\s+(?:un\\s+)?(?:whatsapp|mensaje|texto)?\\s*(?:a|para)?\\s*([a-zA-Z0-9áéíóúÁÉÍÓÚñÑ]+)\\s+(?:que diga|diciendo|que|:)\\s+(.+)",
+            "(?:mandale|manda|enviale|enviar|escribile|decile|contestale|respondele)\\s+(?:un\\s+)?(?:whatsapp|mensaje|texto)?\\s*(?:a|para)?\\s*([a-zA-Z0-9áéíóúÁÉÍÓÚñÑ ]+?)\\s+(?:que diga|diciendo)\\s+(.+)",
             RegexOption.IGNORE_CASE
         )
         val match = regex.find(rawText.trim())
@@ -519,80 +593,13 @@ class GeminiAgent(private val context: Context) {
                     ?.optJSONArray("parts")
                     ?: return@use
 
-                val sb = StringBuilder()
                 for (i in 0 until parts.length()) {
-                    val txt = parts.optJSONObject(i)?.optString("text", "") ?: ""
-                    if (txt.isNotBlank()) sb.append(txt).append(" ")
+                    val part = parts.optJSONObject(i) ?: continue
+                    val text = part.optString("text", "").trim()
+                    if (text.isNotEmpty()) {
+                        return AgentDecision.SpeakOnly(text)
+                    }
                 }
-                val spokenText = sb.toString().trim()
-                if (spokenText.isNotEmpty()) {
-                    return AgentDecision.SpeakOnly(spokenText)
-                }
-            }
-        }
-        return null
-    }
-
-    fun analyzeArgentineBanknote(jpegBytes: ByteArray): String? {
-        val apiKeys = AppPrefs.getGeminiApiKeyList(context)
-        for (apiKey in apiKeys) {
-            if (apiKey.startsWith("AIza")) {
-                val result = analyzeArgentineBanknoteWithKey(apiKey, jpegBytes)
-                if (!result.isNullOrBlank()) return result
-            }
-        }
-        return null
-    }
-
-    private fun analyzeArgentineBanknoteWithKey(apiKey: String, jpegBytes: ByteArray): String? {
-        val base64Image = Base64.encodeToString(jpegBytes, Base64.NO_WRAP)
-
-        val visionPrompt = """
-            Sos los ojos de una persona no vidente en Argentina que te muestra un billete frente a la cámara.
-            Identificá qué billete de Pesos Argentinos aparece:
-            - 10, 20, 50, 100, 200, 500 (Yaguareté), 1000 (Hornero o San Martín), 2000 (Grierson y Carrillo), 10000 (Belgrano), 20000 (Alberdi).
-            Respondé ÚNICAMENTE con la frase corta: "Es de 1000", "Es de 500", "Es de 2000", "Es de 10000", "Es de 20000", "Es de 200", "Es de 100", "Es de 50", "Es de 20" o "Es de 10".
-        """.trimIndent()
-
-        val partsArray = JSONArray()
-            .put(JSONObject().put("text", visionPrompt))
-            .put(JSONObject().apply {
-                put("inline_data", JSONObject().apply {
-                    put("mime_type", "image/jpeg")
-                    put("data", base64Image)
-                })
-            })
-
-        val payload = JSONObject().apply {
-            put("contents", JSONArray().put(JSONObject().apply {
-                put("role", "user")
-                put("parts", partsArray)
-            }))
-        }
-
-        for (model in candidateModels) {
-            val url = "https://generativelanguage.googleapis.com/v1beta/models/$model:generateContent?key=$apiKey"
-            val request = Request.Builder()
-                .url(url)
-                .header("x-goog-api-key", apiKey)
-                .post(payload.toString().toRequestBody("application/json; charset=utf-8".toMediaType()))
-                .build()
-
-            try {
-                client.newCall(request).execute().use { response ->
-                    val bodyStr = response.body?.string() ?: return@use
-                    if (!response.isSuccessful) return@use
-                    val json = JSONObject(bodyStr)
-                    val text = json.optJSONArray("candidates")
-                        ?.optJSONObject(0)
-                        ?.optJSONObject("content")
-                        ?.optJSONArray("parts")
-                        ?.optJSONObject(0)
-                        ?.optString("text", "")
-                        ?.trim()
-                    if (!text.isNullOrBlank()) return text
-                }
-            } catch (_: Exception) {
             }
         }
         return null
