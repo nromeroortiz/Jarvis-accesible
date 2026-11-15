@@ -44,6 +44,7 @@ sealed class AgentDecision {
     data class EndOrAnswerCall(val endCall: Boolean) : AgentDecision()
     data class ToggleWakeWordListening(val enable: Boolean) : AgentDecision()
     data class IdentifyBanknote(val dummy: Boolean = true) : AgentDecision()
+    data class ControlFlashlight(val turnOn: Boolean?) : AgentDecision()
 }
 
 class GeminiAgent(private val context: Context) {
@@ -60,7 +61,7 @@ class GeminiAgent(private val context: Context) {
     )
 
     private val systemPrompt = """
-        Sos Jarvis, un asistente de voz en español rioplatense (Argentina) para una persona ciega.
+        Sos Wally, un asistente de voz en español rioplatense (Argentina) para una persona ciega.
         REGLAS ESTRICTAS:
         1. Si te pide una receta, instrucción o explicación paso a paso, explicala clara y ordenada paso por paso.
         2. Para todo lo demás, respondé MUY CORTO y directo en 1 o 2 oraciones.
@@ -189,7 +190,7 @@ class GeminiAgent(private val context: Context) {
 
     private fun tryFlexibleLocalIntent(rawText: String): AgentDecision? {
         val norm = WhatsAppRepository.normalizeText(rawText)
-            .replace(Regex("^(che\\s+|jarvis\\s+|hola jarvis\\s+|asistente\\s+|por favor\\s+)+"), "")
+            .replace(Regex("^(che\\s+|wally\\s+|wali\\s+|waly\\s+|guali\\s+|buali\\s+|hola wally\\s+|hola wali\\s+|jarvis\\s+|hola jarvis\\s+|asistente\\s+|por favor\\s+)+"), "")
             .trim()
 
         // 0. ¿Qué podés hacer? / Ayuda
@@ -203,9 +204,39 @@ class GeminiAgent(private val context: Context) {
         ) {
             return AgentDecision.SpeakOnly(
                 "Puedo leer tus mensajes nuevos diciendo tengo mensajes, leer el historial de cualquier día diciendo leeme los mensajes de ayer o del viernes, " +
-                    "enviar audios o mensajes escritos por WhatsApp, llamar en altavoz, decirte la hora, la batería, el clima, " +
+                    "enviar audios o mensajes escritos por WhatsApp, prender o apagar la linterna, llamar en altavoz, decirte la hora, la batería, el clima, " +
                     "reconocer billetes con la cámara, poner cualquier canción en YouTube y explicarte recetas paso a paso."
             )
+        }
+
+        // 0B. Linterna ("prende la linterna", "apaga la linterna" y todas sus variantes)
+        if (norm.contains("linterna") || norm.contains("flash")) {
+            val turnOff = norm.contains("apaga") ||
+                norm.contains("apagar") ||
+                norm.contains("apagala") ||
+                norm.contains("desactiva") ||
+                norm.contains("desactivar") ||
+                norm.contains("saca") ||
+                norm.contains("sacar") ||
+                norm.contains("quita") ||
+                norm.contains("corta")
+            val turnOn = norm.contains("prende") ||
+                norm.contains("prender") ||
+                norm.contains("prendela") ||
+                norm.contains("encende") ||
+                norm.contains("encender") ||
+                norm.contains("enciende") ||
+                norm.contains("activa") ||
+                norm.contains("activar") ||
+                norm.contains("pone") ||
+                norm.contains("poner") ||
+                norm.contains("abril") ||
+                norm.contains("abri")
+            return when {
+                turnOff -> AgentDecision.ControlFlashlight(turnOn = false)
+                turnOn -> AgentDecision.ControlFlashlight(turnOn = true)
+                else -> AgentDecision.ControlFlashlight(turnOn = null)
+            }
         }
 
         // 1. Navegación rápida ("siguiente", "anterior" incluyendo homófonos como "interior", "repetir")
@@ -617,7 +648,7 @@ class GeminiAgent(private val context: Context) {
 
     private fun cleanYouTubeQuery(rawText: String): String {
         return rawText
-            .replace(Regex("(?i)^(che\\s+|jarvis\\s+|hola jarvis\\s+|asistente\\s+|por favor\\s+)*"), "")
+            .replace(Regex("(?i)^(che\\s+|wally\\s+|wali\\s+|waly\\s+|guali\\s+|buali\\s+|hola wally\\s+|hola wali\\s+|jarvis\\s+|hola jarvis\\s+|asistente\\s+|por favor\\s+)*"), "")
             .replace(Regex("(?i)^(poneme|pone|poné|poner|reproduci|reproducí|reproducir|reproduce|quiero escuchar|escucha|escuchá|escuchar|busca|buscame)\\s+"), "")
             .replace(Regex("(?i)^(algun tema de|un tema de|una cancion de|una canción de|la cancion|la canción|musica de|música de|videos de|el video de)\\s+"), "")
             .replace(Regex("(?i)\\s+(en youtube|por youtube|de youtube)$"), "")

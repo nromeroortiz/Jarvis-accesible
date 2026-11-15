@@ -6,6 +6,8 @@ import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.PackageManager
+import android.hardware.camera2.CameraCharacteristics
+import android.hardware.camera2.CameraManager
 import android.location.Location
 import android.location.LocationManager
 import android.media.AudioManager
@@ -46,6 +48,60 @@ object SystemActionsController {
 
     private val mainHandler = Handler(Looper.getMainLooper())
 
+    @Volatile
+    private var isFlashlightCurrentlyOn = false
+
+    @Volatile
+    private var isTorchCallbackRegistered = false
+
+    fun setOrCheckFlashlight(context: Context, turnOn: Boolean?): String {
+        return try {
+            val cameraManager = context.getSystemService(Context.CAMERA_SERVICE) as CameraManager
+            if (!isTorchCallbackRegistered) {
+                isTorchCallbackRegistered = true
+                try {
+                    cameraManager.registerTorchCallback(object : CameraManager.TorchCallback() {
+                        override fun onTorchModeChanged(cameraId: String, enabled: Boolean) {
+                            isFlashlightCurrentlyOn = enabled
+                        }
+                    }, mainHandler)
+                } catch (_: Exception) {
+                }
+            }
+
+            val backCameraId = cameraManager.cameraIdList.firstOrNull { id ->
+                val chars = cameraManager.getCameraCharacteristics(id)
+                chars.get(CameraCharacteristics.LENS_FACING) == CameraCharacteristics.LENS_FACING_BACK &&
+                    chars.get(CameraCharacteristics.FLASH_INFO_AVAILABLE) == true
+            } ?: cameraManager.cameraIdList.firstOrNull()
+
+            if (backCameraId == null) {
+                return "Este teléfono no tiene linterna."
+            }
+
+            when (turnOn) {
+                true -> {
+                    cameraManager.setTorchMode(backCameraId, true)
+                    isFlashlightCurrentlyOn = true
+                    "Linterna prendida."
+                }
+                false -> {
+                    cameraManager.setTorchMode(backCameraId, false)
+                    isFlashlightCurrentlyOn = false
+                    "Linterna apagada."
+                }
+                null -> {
+                    val newState = !isFlashlightCurrentlyOn
+                    cameraManager.setTorchMode(backCameraId, newState)
+                    isFlashlightCurrentlyOn = newState
+                    if (newState) "Linterna prendida." else "Linterna apagada."
+                }
+            }
+        } catch (e: Exception) {
+            "No pude controlar la linterna."
+        }
+    }
+
     fun setSilentAlarm(context: Context, hour: Int, minute: Int, label: String): String {
         val validHour = hour.coerceIn(0, 23)
         val validMin = minute.coerceIn(0, 59)
@@ -54,7 +110,7 @@ object SystemActionsController {
             val intent = Intent(AlarmClock.ACTION_SET_ALARM).apply {
                 putExtra(AlarmClock.EXTRA_HOUR, validHour)
                 putExtra(AlarmClock.EXTRA_MINUTES, validMin)
-                putExtra(AlarmClock.EXTRA_MESSAGE, label.ifBlank { "Jarvis" })
+                putExtra(AlarmClock.EXTRA_MESSAGE, label.ifBlank { "Wally" })
                 putExtra(AlarmClock.EXTRA_SKIP_UI, true)
                 addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
             }
@@ -518,10 +574,10 @@ object SystemActionsController {
             norm.contains("ensenname")
 
         val sysInstruction = if (wantsStepByStep) {
-            "Sos Jarvis, un asistente de voz en español rioplatense (Argentina) ayudando a una persona ciega. " +
+            "Sos Wally, un asistente de voz en español rioplatense (Argentina) ayudando a una persona ciega. " +
                 "Explicá exactamente lo que pidió paso a paso (Paso 1, Paso 2, etc.) de forma clara, segura y fácil de seguir de oído. No uses asteriscos ni Markdown."
         } else {
-            "Sos Jarvis, un asistente de voz en español rioplatense (Argentina) para una persona ciega. " +
+            "Sos Wally, un asistente de voz en español rioplatense (Argentina) para una persona ciega. " +
                 "Respondé exactamente a lo que te preguntó en 1 o 2 oraciones cortas y claras. No uses asteriscos ni Markdown."
         }
 

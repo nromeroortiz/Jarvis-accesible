@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <string name="app_name">Jarvis Accesible</string>
-    <string name="accessibility_service_label">Jarvis - Asistente por Voz y Botón Físico</string>
-    <string name="accessibility_service_description">Permite a Jarvis activarse tocando el botón de Subir Volumen sin mirar la pantalla, y presionar automáticamente el botón Enviar en WhatsApp o Reproducir en YouTube para personas con discapacidad visual.</string>
-    <string name="notification_service_label">Jarvis - Lector de Mensajes de WhatsApp</string>
+    <string name="app_name">Wally Accesible</string>
+    <string name="accessibility_service_label">Wally Accesible - Asistente por Voz y Botón Físico</string>
+    <string name="accessibility_service_description">Permite a Wally Accesible activarse tocando el botón de Subir Volumen sin mirar la pantalla, y operar WhatsApp o YouTube por voz para personas con discapacidad visual.</string>
+    <string name="notification_service_label">Wally Accesible - Lector de Mensajes de WhatsApp</string>
 </resources>

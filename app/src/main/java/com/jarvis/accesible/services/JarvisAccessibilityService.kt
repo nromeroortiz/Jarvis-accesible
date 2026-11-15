@@ -30,20 +30,10 @@ data class ScreenChatItem(
     val isAudio: Boolean,
     val text: String,
     val topY: Int,
-    val audioOrderInDay: Int, // Índice 0-based entre los audios visibles de ese día (0 = primero de arriba)
+    val audioOrderInDay: Int,
     val audioDurationMs: Long = 12_000L
 )
 
-/**
- * Servicio de Accesibilidad de Android:
- * 1. Doble toque en Subir Volumen para hablar manos libres (y pausa en el acto cualquier audio de WhatsApp para escuchar limpio).
- * 2. En WhatsApp:
- *    - Graba y envía AUDIOS NATIVOS de WhatsApp manteniendo y deslizando hacia arriba el botón de micrófono del chat
- *      (candado manos libres de WhatsApp) y tocando el botón Enviar al detectar 2 segundos de silencio o doble toque de Volumen Arriba.
- *    - En modo "Mensajes nuevos / Reproducilo", reproduce únicamente el último audio recibido sin ir al principio del día.
- *    - En modo "Leeme los mensajes de [día] de [persona]", sube con scroll hasta que el cartel de ese día ("HOY", "AYER", "VIERNES")
- *      quede arriba de todo para empezar SIEMPRE desde el primer mensaje real de ese día, y baja con scroll si el día es largo.
- */
 class JarvisAccessibilityService : AccessibilityService() {
 
     private val mainHandler = Handler(Looper.getMainLooper())
@@ -53,11 +43,29 @@ class JarvisAccessibilityService : AccessibilityService() {
     private var searchAlternateTried = false
     private var silenceMonitorAudioRecord: AudioRecord? = null
 
+    @Volatile
+    private var currentForegroundPackage: String = ""
+
     override fun onServiceConnected() {
         super.onServiceConnected()
         instance = this
         JarvisForegroundService.startServiceIfPossible(applicationContext)
         JarvisCoordinator.getInstance(applicationContext).speechInput.syncWakeWordLoop()
+    }
+
+    /**
+     * Devuelve true si el usuario está usando Instagram, TikTok, YouTube, Spotify o Netflix
+     * para que la escucha ambiental por voz ("Wally") no le pause los videos cada varios segundos.
+     */
+    fun isMediaAppInForeground(): Boolean {
+        val pkg = (rootInActiveWindow?.packageName?.toString() ?: currentForegroundPackage).lowercase()
+        return pkg.contains("instagram") ||
+            pkg.contains("musically") ||
+            pkg.contains("trill") ||
+            pkg.contains("tiktok") ||
+            pkg.contains("youtube") ||
+            pkg.contains("spotify") ||
+            pkg.contains("netflix")
     }
 
     override fun onKeyEvent(event: KeyEvent?): Boolean {
@@ -68,7 +76,6 @@ class JarvisAccessibilityService : AccessibilityService() {
             val now = System.currentTimeMillis()
             if (now - lastVolumeUpDownTime in 80L..650L) {
                 lastVolumeUpDownTime = 0L
-                // Si estaba grabando un audio nativo en WhatsApp o en el grabador interno, el doble toque lo envía en el acto
                 if (isNativeWhatsAppRecordingActive) {
                     finishAndSendNativeWhatsAppRecordingNow()
                     return true
@@ -76,7 +83,6 @@ class JarvisAccessibilityService : AccessibilityService() {
                 if (WhatsAppRepository.finishActiveVoiceNoteRecordingIfAny(applicationContext)) {
                     return true
                 }
-                // Pausamos cualquier nota de voz que esté sonando en pantalla para que el micrófono escuche "Siguiente"/"Anterior" sin interferencia
                 pauseAnyPlayingVoiceNoteOnScreen()
                 JarvisCoordinator.getInstance(applicationContext).triggerHandsFreeListening(greetBeforeListening = false)
                 return true
@@ -89,20 +95,25 @@ class JarvisAccessibilityService : AccessibilityService() {
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
         if (event == null) return
         val pkg = event.packageName?.toString() ?: return
+        if (!pkg.startsWith("com.android.systemui") && !pkg.startsWith("android")) {
+            currentForegroundPackage = pkg
+        }
         val now = System.currentTimeMillis()
 
         if (pkg.startsWith("com.whatsapp")) {
-            // A) Clic automático en "Enviar" o "Aceptar / OK" al mandar mensaje o audio
+            // A) Clic automático en "Aceptar / OK" y luego en "Enviar" al mandar mensaje o audio
             if (now < autoClickSendUntilTimestamp) {
                 val root = rootInActiveWindow ?: return
                 if (findAndClickAcceptOrSendInWhatsApp(root)) {
-                    // Seguimos atentos 1.5s más por si después de "Aceptar" aparece el botón verde de "Enviar"
-                    mainHandler.postDelayed({
-                        val freshRoot = rootInActiveWindow
-                        if (freshRoot != null) {
-                            findAndClickAcceptOrSendInWhatsApp(freshRoot)
-                        }
-                    }, 700L)
+                    // Seguimos verificando a los 600ms, 1200ms y 1800ms porque tras tocar "Aceptar" aparece la pantalla con el botón verde "Enviar"
+                    for (delayMs in listOf(600L, 1200L, 1800L)) {
+                        mainHandler.postDelayed({
+                            val freshRoot = rootInActiveWindow
+                            if (freshRoot != null) {
+                                findAndClickAcceptOrSendInWhatsApp(freshRoot)
+                            }
+                        }, delayMs)
+                    }
                     autoClickSendUntilTimestamp = 0L
                     pendingSendRecipientName = null
                 } else if (!pendingSendRecipientName.isNullOrBlank()) {
@@ -129,7 +140,12 @@ class JarvisAccessibilityService : AccessibilityService() {
                     autoStartNativeMicUntilTimestamp = 0L
                     val cb = onNativeMicReadyCallback
                     onNativeMicReadyCallback = null
-                    cb?.invoke(micBounds)
+                    // Esperamos 450ms para que termine la animación de apertura del chat antes de apoyar el gesto en el micrófono
+                    mainHandler.postDelayed({
+                        val freshRoot = rootInActiveWindow
+                        val freshBounds = if (freshRoot != null) findWhatsAppMicButtonBounds(freshRoot) ?: micBounds else micBounds
+                        cb?.invoke(freshBounds)
+                    }, 450L)
                 }
                 return
             }
@@ -175,20 +191,29 @@ class JarvisAccessibilityService : AccessibilityService() {
     }
 
     /**
+     * Busca el botón de micrófono en la pantalla actual de WhatsApp si el chat ya está abierto.
+     */
+    fun getVisibleWhatsAppMicBoundsNow(): Rect? {
+        val root = rootInActiveWindow ?: return null
+        return findWhatsAppMicButtonBounds(root)
+    }
+
+    /**
      * Inicia la grabación de un audio NATIVO de WhatsApp dentro del chat abierto:
-     * Mantiene presionado el botón de micrófono de WhatsApp y desliza hacia arriba para trabar el candado manos libres.
-     * Monitorea el silencio del usuario (2 segundos luego de hablar) o el doble toque de Volumen Arriba para tocar Enviar.
+     * Despacha primero el trazo de mantener presionado (strokeHold) y en su onCompleted despacha la continuación
+     * deslizando hacia arriba al candado (strokeSwipe), que es la forma exigida por Android InputDispatcher.
+     * Si el teléfono no permite el gesto, llama a onGestureFailedFallback para grabar y auto-aceptar sin dar error.
      */
     fun lockNativeWhatsAppMicAndRecord(
         micRect: Rect,
         onRecordingLocked: () -> Unit,
+        onGestureFailedFallback: () -> Unit,
         onFinishedSending: (String) -> Unit
     ) {
-        val cx = micRect.exactCenterX().coerceIn(100f, 1050f)
-        val cy = micRect.exactCenterY().coerceIn(400f, 2350f)
-        val lockY = (cy - 320f).coerceAtLeast(300f)
+        val cx = micRect.exactCenterX().coerceIn(80f, 1200f)
+        val cy = micRect.exactCenterY().coerceIn(400f, 2500f)
+        val lockY = (cy - 340f).coerceAtLeast(300f)
 
-        // Gesto en 2 trazos continuos: 1) Mantener presionado el botón de micrófono 650ms, 2) Deslizar hacia arriba al candado
         val holdPath = Path().apply {
             moveTo(cx, cy)
             lineTo(cx, cy)
@@ -198,34 +223,96 @@ class JarvisAccessibilityService : AccessibilityService() {
             lineTo(cx, lockY)
         }
 
-        val strokeHold = GestureDescription.StrokeDescription(holdPath, 0L, 650L, true)
-        val strokeSwipe = strokeHold.continueStroke(swipeUpPath, 0L, 450L, false)
-        val gesture = GestureDescription.Builder()
-            .addStroke(strokeHold)
-            .addStroke(strokeSwipe)
-            .build()
-
         isNativeWhatsAppRecordingActive = true
         nativeRecordingFinishedCallback = onFinishedSending
 
-        val dispatched = dispatchGesture(gesture, object : GestureResultCallback() {
+        // Paso 1: Mantener presionado el botón de micrófono durante 600ms con willContinue = true (en su propio GestureDescription)
+        val strokeHold = GestureDescription.StrokeDescription(holdPath, 0L, 600L, true)
+        val holdGesture = GestureDescription.Builder().addStroke(strokeHold).build()
+
+        val dispatchedHold = dispatchGesture(holdGesture, object : GestureResultCallback() {
             override fun onCompleted(gestureDescription: GestureDescription?) {
-                onRecordingLocked()
-                startNativeRecordingSilenceMonitor()
+                // Paso 2: Ahora sí despachamos el segundo GestureDescription que desliza hacia arriba hasta el candado
+                val strokeSwipe = strokeHold.continueStroke(swipeUpPath, 0L, 450L, false)
+                val swipeGesture = GestureDescription.Builder().addStroke(strokeSwipe).build()
+                dispatchGesture(swipeGesture, object : GestureResultCallback() {
+                    override fun onCompleted(gd: GestureDescription?) {
+                        onRecordingLocked()
+                        startNativeRecordingSilenceMonitor()
+                    }
+
+                    override fun onCancelled(gd: GestureDescription?) {
+                        trySingleStrokeSwipeUp(cx, cy, lockY, onRecordingLocked, onGestureFailedFallback)
+                    }
+                }, mainHandler)
+            }
+
+            override fun onCancelled(gestureDescription: GestureDescription?) {
+                // Si el dispositivo no soporta willContinue=true, probamos un único trazo continuo hacia el candado
+                trySingleStrokeSwipeUp(cx, cy, lockY, onRecordingLocked, onGestureFailedFallback)
+            }
+        }, mainHandler)
+
+        if (!dispatchedHold) {
+            trySingleStrokeSwipeUp(cx, cy, lockY, onRecordingLocked, onGestureFailedFallback)
+        }
+    }
+
+    private fun trySingleStrokeSwipeUp(
+        cx: Float,
+        cy: Float,
+        lockY: Float,
+        onRecordingLocked: () -> Unit,
+        onGestureFailedFallback: () -> Unit
+    ) {
+        val singlePath = Path().apply {
+            moveTo(cx, cy)
+            lineTo(cx, cy - 10f)
+            lineTo(cx, lockY)
+        }
+        val singleStroke = GestureDescription.StrokeDescription(singlePath, 0L, 1100L, false)
+        val gesture = GestureDescription.Builder().addStroke(singleStroke).build()
+
+        val ok = dispatchGesture(gesture, object : GestureResultCallback() {
+            override fun onCompleted(gestureDescription: GestureDescription?) {
+                // Verificamos a los 450ms si realmente quedó grabando en WhatsApp; si no, usamos el respaldo automático
+                mainHandler.postDelayed({
+                    val root = rootInActiveWindow
+                    if (root != null && isWhatsAppVoiceRecorderUiVisible(root)) {
+                        onRecordingLocked()
+                        startNativeRecordingSilenceMonitor()
+                    } else {
+                        isNativeWhatsAppRecordingActive = false
+                        nativeRecordingFinishedCallback = null
+                        onGestureFailedFallback()
+                    }
+                }, 450L)
             }
 
             override fun onCancelled(gestureDescription: GestureDescription?) {
                 isNativeWhatsAppRecordingActive = false
                 nativeRecordingFinishedCallback = null
-                onFinishedSending("No pude mantener apretado el micrófono de WhatsApp.")
+                onGestureFailedFallback()
             }
         }, mainHandler)
 
-        if (!dispatched) {
+        if (!ok) {
             isNativeWhatsAppRecordingActive = false
             nativeRecordingFinishedCallback = null
-            onFinishedSending("No pude activar el micrófono de WhatsApp.")
+            onGestureFailedFallback()
         }
+    }
+
+    private fun isWhatsAppVoiceRecorderUiVisible(root: AccessibilityNodeInfo): Boolean {
+        val recorderIds = listOf(
+            "com.whatsapp:id/voice_recorder_send_btn",
+            "com.whatsapp:id/voice_note_cancel_btn",
+            "com.whatsapp:id/voice_note_slide_to_cancel_animation"
+        )
+        for (id in recorderIds) {
+            if (!root.findAccessibilityNodeInfosByViewId(id).isNullOrEmpty()) return true
+        }
+        return false
     }
 
     @SuppressLint("MissingPermission")
@@ -236,7 +323,6 @@ class JarvisAccessibilityService : AccessibilityService() {
         var peakAmplitude = 1400
         var hasDetectedSpeech = false
 
-        // Android 10+ permite que un AccessibilityService escuche el nivel de voz para detectar silencio
         val audioRecord = try {
             if (ContextCompat.checkSelfPermission(applicationContext, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) {
                 val minBuf = AudioRecord.getMinBufferSize(
@@ -295,7 +381,6 @@ class JarvisAccessibilityService : AccessibilityService() {
                 }
 
                 val silenceMs = now - lastSoundTime
-                // Si habló y luego hizo 2.1 segundos de silencio (o si pasaron 35s máximo), enviamos el audio nativo
                 val shouldSend = elapsed >= 35_000L ||
                     (hasDetectedSpeech && elapsed >= 2_400L && silenceMs >= 2_100L) ||
                     (!hasDetectedSpeech && elapsed >= 8_000L && currentMaxAmp == 0)
@@ -336,7 +421,6 @@ class JarvisAccessibilityService : AccessibilityService() {
             sent = findAndClickNativeVoiceNoteSendButton(root)
         }
         if (!sent) {
-            // Si el botón Enviar de la barra de voz está en la esquina inferior derecha, hacemos clic por nodo o gesto en (980, 2150)
             mainHandler.postDelayed({
                 val fresh = rootInActiveWindow
                 if (fresh != null) {
@@ -406,9 +490,6 @@ class JarvisAccessibilityService : AccessibilityService() {
         return clickByContentDescriptionOrText(root, listOf("enviar", "send"))
     }
 
-    /**
-     * Busca un contacto en WhatsApp tolerando diferencias fonéticas ("Dayana UNLa" <-> "Daiana UNLa").
-     */
     private fun handleWhatsAppSearchBarFlow(root: AccessibilityNodeInfo) {
         val query = pendingSearchContactName ?: return
 
@@ -513,22 +594,10 @@ class JarvisAccessibilityService : AccessibilityService() {
         return false
     }
 
-    /**
-     * Analiza el chat abierto para el día pedido ("hoy", "ayer", "viernes", etc.):
-     * - Si el cartel del día pedido todavía NO apareció, o si el cartel del día pedido está muy abajo en la pantalla
-     *   (o si ni siquiera apareció un cartel arriba porque el día tiene muchos mensajes más arriba),
-     *   hace scroll hacia arriba hasta posicionar el comienzo del día en la parte superior de la pantalla.
-     *   Así SIEMPRE empieza desde el PRIMER mensaje real de ese día (solucionando el problema de Daiana UNLa y del viernes).
-     */
     private fun processOpenChatForRequestedDay(root: AccessibilityNodeInfo) {
         val targetDay = normalize(requestedDayFilter ?: "hoy")
         val extracted = extractChatItemsByDayFromTree(root, targetDay)
 
-        // ¿Necesitamos seguir subiendo hacia arriba para llegar al PRIMER mensaje de ese día?
-        // 1. Si no encontramos el cartel del día pedido (y tampoco vimos un cartel de un día más viejo arriba), subimos.
-        // 2. Si encontramos el cartel del día pedido pero está en la mitad inferior de la pantalla (headerTopY > 650),
-        //    no hay que subir (más bien el día empieza ahí mismo). Pero si NO vimos el cartel del día pedido
-        //    (porque el cartel quedó más arriba fuera de la pantalla), debemos subir hasta ver el cartel del día pedido!
         val needsScrollUpToFindStartOfDay = !extracted.sawExactDayHeaderBanner && scrollAttemptsLeft > 0
 
         if (needsScrollUpToFindStartOfDay) {
@@ -539,8 +608,6 @@ class JarvisAccessibilityService : AccessibilityService() {
             }
         }
 
-        // Si el cartel del día pedido apareció muy abajo (ej. topY > 1450) y no entran sus mensajes en pantalla,
-        // bajamos un poco (scroll forward) para que sus mensajes queden visibles en pantalla.
         if (extracted.sawExactDayHeaderBanner && extracted.items.isEmpty() && extracted.headerTopY > 1200) {
             if (scrollChatListForward(root)) {
                 mainHandler.postDelayed({
@@ -562,10 +629,6 @@ class JarvisAccessibilityService : AccessibilityService() {
         cb?.invoke(items)
     }
 
-    /**
-     * Cuando un día tiene muchos mensajes y llegamos al último visible de la pantalla actual,
-     * hace scroll hacia abajo (forward) para cargar los siguientes mensajes de ese mismo día.
-     */
     fun scrollDownForMoreItemsInSameDay(
         dayFilterRaw: String,
         alreadyReadTexts: Set<String>,
@@ -598,7 +661,7 @@ class JarvisAccessibilityService : AccessibilityService() {
     )
 
     private data class RawScreenElement(
-        val type: String, // "HEADER", "TEXT", "AUDIO", "DURATION"
+        val type: String,
         val text: String,
         val topY: Int,
         val durationMs: Long = 0L
@@ -640,8 +703,6 @@ class JarvisAccessibilityService : AccessibilityService() {
             }
         }
 
-        // Si ya hicimos todos los intentos de scroll hacia arriba (o estamos continuando hacia abajo en el mismo día)
-        // y el cartel quedó más arriba de la pantalla:
         if (!sawRequestedHeader && matchingItems.isEmpty() && (scrollAttemptsLeft <= 0 || allowWithoutBannerIfContinuing)) {
             if (headers.isEmpty()) {
                 if (targetDayNorm == "hoy" || allowWithoutBannerIfContinuing) {
@@ -650,7 +711,6 @@ class JarvisAccessibilityService : AccessibilityService() {
             } else {
                 val firstH = headers.first()
                 val firstHNorm = normalize(firstH.text)
-                // Si el primer cartel visible en pantalla es "HOY" y el usuario pidió "ayer", los mensajes ARRIBA del cartel "HOY" son de ayer!
                 if (targetDayNorm == "ayer" && headerMatchesDay(firstHNorm, "hoy")) {
                     matchingItems.addAll(mainElements.filter { it.type != "HEADER" && it.topY < firstH.topY })
                 } else if (targetDayNorm == "hoy" && !headerMatchesDay(firstHNorm, "hoy")) {
@@ -809,7 +869,6 @@ class JarvisAccessibilityService : AccessibilityService() {
                 return
             }
 
-            // Solo tomamos el mensaje principal (no quoted_text de respuesta citada para no leer duplicado ni desordenado)
             val isMessageTextView = viewId.endsWith(":id/message_text") ||
                 viewId.endsWith(":id/caption")
             if (isMessageTextView && text.isNotEmpty() && !text.matches(Regex("^\\d{1,2}:\\d{2}(\\s*[ap]\\.?\\s*m\\.?)?$", RegexOption.IGNORE_CASE))) {
@@ -846,9 +905,6 @@ class JarvisAccessibilityService : AccessibilityService() {
         return 0L
     }
 
-    /**
-     * Reproduce ÚNICAMENTE el último audio de abajo de todo en el chat abierto (para "¿Tengo mensajes?" / "Reproducilo").
-     */
     fun clickLatestAudioInCurrentChatScreen(rootNode: AccessibilityNodeInfo? = rootInActiveWindow): Boolean {
         val root = rootNode ?: return false
         val headers = mutableListOf<RawScreenElement>()
@@ -863,9 +919,6 @@ class JarvisAccessibilityService : AccessibilityService() {
         return clickNodeOrParent(latestButton)
     }
 
-    /**
-     * Hace clic en el audio de la posición indicada dentro del día pedido (0 = el primer audio de ese día, 1 = el segundo, etc.).
-     */
     fun clickAudioInCurrentScreenByDayOrder(targetDayRaw: String, audioOrderInDay: Int): Boolean {
         val now = System.currentTimeMillis()
         if (now < lastVoiceNoteClickTime + 900L) return false
@@ -1116,6 +1169,8 @@ class JarvisAccessibilityService : AccessibilityService() {
     private fun findAndClickAcceptOrSendInWhatsApp(root: AccessibilityNodeInfo): Boolean {
         val sendIds = listOf(
             "android:id/button1", // Botón "Aceptar" / "OK" en diálogos de confirmación de WhatsApp
+            "com.whatsapp:id/button1",
+            "com.whatsapp:id/ok",
             "com.whatsapp:id/send",
             "com.whatsapp:id/send_container",
             "com.whatsapp:id/voice_recorder_send_btn",
@@ -1129,7 +1184,7 @@ class JarvisAccessibilityService : AccessibilityService() {
                 }
             }
         }
-        return clickByContentDescriptionOrText(root, listOf("enviar", "send", "aceptar", "ok"))
+        return clickByContentDescriptionOrText(root, listOf("aceptar", "ok", "enviar", "send", "continuar"))
     }
 
     private fun findAndClickFirstYouTubeItem(root: AccessibilityNodeInfo): Boolean {
@@ -1177,8 +1232,8 @@ class JarvisAccessibilityService : AccessibilityService() {
         keywords: List<String>
     ): Boolean {
         if (node == null) return false
-        val desc = node.contentDescription?.toString()?.lowercase() ?: ""
-        val text = node.text?.toString()?.lowercase() ?: ""
+        val desc = node.contentDescription?.toString()?.lowercase()?.trim() ?: ""
+        val text = node.text?.toString()?.lowercase()?.trim() ?: ""
 
         if (keywords.any { desc == it || desc.startsWith("$it ") || text == it }) {
             if (clickNodeOrParent(node)) return true
@@ -1301,8 +1356,6 @@ class JarvisAccessibilityService : AccessibilityService() {
             val cleanDay = dayFilter.ifBlank { "hoy" }.lowercase().trim()
             requestedDayFilter = cleanDay
             onDayChatItemsReadyCallback = onReady
-            // Para "hoy" permitimos hasta 8 scrolls hacia arriba (hasta encontrar el cartel "HOY" arriba de todo);
-            // para "ayer", "viernes" u otros días anteriores permitimos hasta 20 scrolls hacia arriba para chats largos!
             instance?.scrollAttemptsLeft = if (cleanDay == "hoy") 8 else 20
             autoInspectDayChatUntilTimestamp = System.currentTimeMillis() + 20_000L
         }

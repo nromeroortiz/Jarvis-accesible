@@ -154,14 +154,14 @@ fun JarvisMainScreen(resumeKey: Int) {
             .background(Color(0xFF0D1117))
             .padding(16.dp)
     ) {
-        // Barra superior para alternar entre el Botón Gigante del tío y el Panel de Configuración del sobrino
+        // Barra superior para alternar entre el Botón Gigante y el Panel de Configuración
         Row(
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.SpaceBetween,
             verticalAlignment = Alignment.CenterVertically
         ) {
             Text(
-                text = "Jarvis Accesible",
+                text = "Wally Accesible",
                 color = Color.White,
                 fontSize = 22.sp,
                 fontWeight = FontWeight.Bold
@@ -171,7 +171,7 @@ fun JarvisMainScreen(resumeKey: Int) {
                 colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF21262D))
             ) {
                 Text(
-                    text = if (showSetupPanel) "Ver Botón Gigante" else "Configuración (Sobrino)",
+                    text = if (showSetupPanel) "Ver Botón Gigante" else "Configuración",
                     color = Color(0xFFFFD600),
                     fontWeight = FontWeight.SemiBold
                 )
@@ -203,7 +203,7 @@ fun JarvisMainScreen(resumeKey: Int) {
                     .background(buttonBgColor, shape = RoundedCornerShape(28.dp))
                     .semantics {
                         contentDescription =
-                            "Hablar con el asistente Jarvis. Tocá cualquier parte de la pantalla o presioná dos veces el botón de Subir Volumen."
+                            "Hablar con el asistente Wally. Tocá cualquier parte de la pantalla o presioná dos veces el botón de Subir Volumen."
                     }
                     .clickable {
                         if (!checkRuntimePermissions(context)) {
@@ -370,7 +370,7 @@ fun JarvisMainScreen(resumeKey: Int) {
                 ) {
                     Column(modifier = Modifier.padding(16.dp)) {
                         Text(
-                            text = "2. Cómo activa tu tío al asistente",
+                            text = "2. Cómo activar el asistente",
                             color = Color(0xFFFFD600),
                             fontSize = 18.sp,
                             fontWeight = FontWeight.Bold
@@ -412,12 +412,12 @@ fun JarvisMainScreen(resumeKey: Int) {
                         ) {
                             Column(modifier = Modifier.weight(1f)) {
                                 Text(
-                                    text = "Activar también por voz (\"Hola Jarvis\")",
+                                    text = "Activar también por voz (\"Wally\")",
                                     color = Color.White,
                                     fontWeight = FontWeight.SemiBold
                                 )
                                 Text(
-                                    text = "Se puede apagar acá o por voz para ahorrar batería.",
+                                    text = "Se pausa solo cuando mirás videos o escuchás música para no cortarlos.",
                                     color = Color.LightGray,
                                     fontSize = 13.sp
                                 )

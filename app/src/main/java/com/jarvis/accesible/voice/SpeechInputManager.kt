@@ -4,6 +4,7 @@ import android.Manifest
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.media.AudioManager
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
@@ -14,8 +15,9 @@ import androidx.core.content.ContextCompat
 import com.jarvis.accesible.core.AppPrefs
 
 /**
- * Gestiona tanto la escucha de comandos manos libres (sin tener que mantener apretado ningún botón)
- * como el modo opcional de activación por voz diciendo explícitamente "Jarvis" / "Hola Jarvis".
+ * Gestiona tanto la escucha de comandos manos libres (con doble toque de Subir Volumen o botón en pantalla)
+ * como el modo opcional de activación por voz diciendo "Wally" / "Hola Wally".
+ * No interrumpe videos de Instagram, TikTok ni YouTube.
  */
 class SpeechInputManager(
     private val context: Context,
@@ -26,6 +28,7 @@ class SpeechInputManager(
     private val isBusySpeakingOrPlaying: (() -> Boolean)? = null
 ) {
     private val mainHandler = Handler(Looper.getMainLooper())
+    private val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
     private var speechRecognizer: SpeechRecognizer? = null
 
     @Volatile
@@ -174,16 +177,23 @@ class SpeechInputManager(
             if (AppPrefs.isWakeWordEnabled(context) && !isActivelyListeningCommand) {
                 startWakeWordSingleCycle()
             }
-        }, 1800L)
+        }, 2000L)
     }
 
     private fun startWakeWordSingleCycle() {
         if (isActivelyListeningCommand || !AppPrefs.isWakeWordEnabled(context)) return
         if (ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) return
 
-        // Si Jarvis está hablando o reproduciendo un audio, esperamos sin prender el micrófono ambiental
-        if (isBusySpeakingOrPlaying?.invoke() == true) {
-            mainHandler.postDelayed({ startWakeWordSingleCycle() }, 2000L)
+        // Si el usuario está viendo un video o escuchando música/audio (Instagram, TikTok, YouTube, Spotify, WhatsApp)
+        // o si Wally está hablando, NO abrimos el SpeechRecognizer ambiental para nunca pausarle el video.
+        val isMediaPlayingNow = try {
+            audioManager.isMusicActive
+        } catch (_: Exception) {
+            false
+        }
+        if (isMediaPlayingNow || isBusySpeakingOrPlaying?.invoke() == true) {
+            destroyRecognizer()
+            mainHandler.postDelayed({ startWakeWordSingleCycle() }, 3000L)
             return
         }
 
@@ -202,7 +212,7 @@ class SpeechInputManager(
 
                 override fun onError(error: Int) {
                     if (AppPrefs.isWakeWordEnabled(context) && !isActivelyListeningCommand) {
-                        mainHandler.postDelayed({ startWakeWordSingleCycle() }, 1800L)
+                        mainHandler.postDelayed({ startWakeWordSingleCycle() }, 2000L)
                     }
                 }
 
@@ -211,10 +221,9 @@ class SpeechInputManager(
                     val heard = matches?.firstOrNull()?.lowercase()?.trim() ?: ""
                     val customWake = AppPrefs.getWakeWordPhrase(context).lowercase().trim()
 
-                    // Solo activamos si la oración empieza explícitamente llamando a "Jarvis" (ej. "Jarvis", "Hola Jarvis", "Che Jarvis")
-                    // Ignoramos charlas del entorno o televisión donde no se lo llamó al principio.
+                    // Solo activamos si la oración empieza explícitamente llamando a "Wally" (o "Jarvis")
                     val wakeRegex = Regex(
-                        "^(?:hola\\s+|che\\s+|ok\\s+|hey\\s+|buen dia\\s+)?(?:jarvis|sharvis|yarvis|charvis|${Regex.escape(customWake)})(?:\\b|[\\s,.:;!?]+)(.*)$",
+                        "^(?:hola\\s+|che\\s+|ok\\s+|hey\\s+|buen dia\\s+)?(?:wally|wali|waly|wall-e|wall e|guali|buali|jarvis|sharvis|${Regex.escape(customWake)})(?:\\b|[\\s,.:;!?]+)(.*)$",
                         RegexOption.IGNORE_CASE
                     )
                     val match = wakeRegex.find(heard)
@@ -222,7 +231,7 @@ class SpeechInputManager(
                         val commandAfterWakeWord = match.groupValues.getOrNull(1)?.trim().orEmpty()
                         onWakeWordDetected(commandAfterWakeWord.ifEmpty { null })
                     } else if (AppPrefs.isWakeWordEnabled(context) && !isActivelyListeningCommand) {
-                        mainHandler.postDelayed({ startWakeWordSingleCycle() }, 900L)
+                        mainHandler.postDelayed({ startWakeWordSingleCycle() }, 1000L)
                     }
                 }
 

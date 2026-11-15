@@ -54,7 +54,7 @@ object AppPrefs {
     }
 
     fun getWakeWordPhrase(context: Context): String =
-        prefs(context).getString(KEY_WAKE_WORD_PHRASE, "jarvis")?.lowercase()?.trim() ?: "jarvis"
+        prefs(context).getString(KEY_WAKE_WORD_PHRASE, "wally")?.lowercase()?.trim() ?: "wally"
 
     fun setWakeWordPhrase(context: Context, phrase: String) {
         prefs(context).edit().putString(KEY_WAKE_WORD_PHRASE, phrase.lowercase().trim()).apply()

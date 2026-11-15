@@ -80,7 +80,7 @@ class JarvisForegroundService : Service() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             val channel = NotificationChannel(
                 CHANNEL_ID,
-                "Asistente Jarvis Activo",
+                "Asistente Wally Activo",
                 NotificationManager.IMPORTANCE_LOW
             ).apply {
                 description = "Mantiene el asistente de voz siempre listo para personas con discapacidad visual"
@@ -101,8 +101,8 @@ class JarvisForegroundService : Service() {
         )
 
         return NotificationCompat.Builder(this, CHANNEL_ID)
-            .setContentTitle("Jarvis Accesible está listo")
-            .setContentText("Tocá dos veces Subir Volumen o hablá para pedir lo que necesites")
+            .setContentTitle("Wally Accesible está listo")
+            .setContentText("Tocá dos veces Subir Volumen o decí Wally para pedir lo que necesites")
             .setSmallIcon(android.R.drawable.ic_btn_speak_now)
             .setContentIntent(pendingIntent)
             .setOngoing(true)

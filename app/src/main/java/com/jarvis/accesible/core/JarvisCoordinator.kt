@@ -90,7 +90,9 @@ class JarvisCoordinator private constructor(private val context: Context) {
             isListeningUiState = listening
         },
         isBusySpeakingOrPlaying = {
-            speaker.isSpeakingNow || WhatsAppRepository.isCurrentlyPlayingOrRecordingAudio()
+            speaker.isSpeakingNow ||
+                WhatsAppRepository.isCurrentlyPlayingOrRecordingAudio() ||
+                (JarvisAccessibilityService.instance?.isMediaAppInForeground() == true)
         }
     )
 
@@ -117,8 +119,7 @@ class JarvisCoordinator private constructor(private val context: Context) {
     }
 
     private fun startNativeAudioRecordingForContact(targetRaw: String) {
-        val contact = WhatsAppRepository.findContactByName(context, targetRaw)
-        val displayName = contact?.first ?: targetRaw
+        val displayName = WhatsAppRepository.openContactChatOnly(context, targetRaw)
         speechInput.stopAllListening()
         speaker.speak("Grabando audio para $displayName. Hablá después del tono.") {
             WhatsAppRepository.recordAndSendRealVoiceNote(
@@ -419,6 +420,11 @@ class JarvisCoordinator private constructor(private val context: Context) {
                             speaker.speak(result)
                         }
                     }
+                }
+
+                is AgentDecision.ControlFlashlight -> {
+                    val msg = SystemActionsController.setOrCheckFlashlight(context, decision.turnOn)
+                    speaker.speak(msg)
                 }
             }
         }

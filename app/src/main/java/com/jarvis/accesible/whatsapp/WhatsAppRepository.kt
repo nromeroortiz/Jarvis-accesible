@@ -971,19 +971,37 @@ object WhatsAppRepository {
 
         val service = JarvisAccessibilityService.instance
         if (service != null) {
-            // Abrimos el chat de la persona y apenas aparece el botón de micrófono nativo de WhatsApp,
-            // mantenemos presionado y deslizamos hacia arriba al candado manos libres.
-            JarvisAccessibilityService.requestWaitForNativeMicInOpenChat { micRect ->
+            val startLockOnMic: (android.graphics.Rect) -> Unit = { micRect ->
                 onRecordingStarted()
                 mainHandler.postDelayed({
                     service.lockNativeWhatsAppMicAndRecord(
                         micRect = micRect,
                         onRecordingLocked = {},
+                        onGestureFailedFallback = {
+                            recordInternalFallbackVoiceNote(
+                                context = context,
+                                displayName = displayName,
+                                contactPhone = contact?.second,
+                                onRecordingStarted = {},
+                                onCompleted = onCompleted
+                            )
+                        },
                         onFinishedSending = { statusMsg ->
                             onCompleted(statusMsg)
                         }
                     )
                 }, 260L)
+            }
+
+            // Si el chat ya quedó abierto mientras Wally decía "Grabando audio para...", usamos el micrófono en el acto
+            val existingMic = service.getVisibleWhatsAppMicBoundsNow()
+            if (existingMic != null) {
+                startLockOnMic(existingMic)
+                return
+            }
+
+            JarvisAccessibilityService.requestWaitForNativeMicInOpenChat { micRect ->
+                startLockOnMic(micRect)
             }
 
             if (contact != null) {
