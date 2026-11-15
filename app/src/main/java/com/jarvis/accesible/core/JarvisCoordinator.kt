@@ -2,6 +2,11 @@ package com.jarvis.accesible.core
 
 import android.annotation.SuppressLint
 import android.content.Context
+import android.os.Handler
+import android.os.Looper
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.setValue
 import com.jarvis.accesible.actions.SystemActionsController
 import com.jarvis.accesible.ai.AgentDecision
 import com.jarvis.accesible.ai.GeminiAgent
@@ -21,8 +26,15 @@ import kotlinx.coroutines.launch
 class JarvisCoordinator private constructor(private val context: Context) {
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
+    private val mainHandler = Handler(Looper.getMainLooper())
     val speaker = SpeakerManager(context)
-    private val geminiAgent = GeminiAgent(context)
+    val geminiAgent = GeminiAgent(context)
+
+    var isListeningUiState by mutableStateOf(false)
+        private set
+
+    var isProcessingUiState by mutableStateOf(false)
+        private set
 
     // Si hay un mensaje de texto de WhatsApp esperando que el tío diga "Sí, mandalo" o "Cancelar"
     private var pendingWhatsAppConfirmation: Pair<String, String>? = null
@@ -41,12 +53,17 @@ class JarvisCoordinator private constructor(private val context: Context) {
             }
         },
         onListeningError = {
+            isListeningUiState = false
+            isProcessingUiState = false
             if (pendingWhatsAppConfirmation != null) {
                 pendingWhatsAppConfirmation = null
                 speaker.speak("No te escuché, cancelé el envío del mensaje.")
             } else {
                 speaker.speak("No llegué a escucharte. Tocá el botón o llamame cuando quieras.")
             }
+        },
+        onListeningStateChanged = { listening ->
+            isListeningUiState = listening
         }
     )
 
@@ -63,15 +80,22 @@ class JarvisCoordinator private constructor(private val context: Context) {
         if (greetBeforeListening) {
             speaker.speak("Sí, te escucho") {
                 speaker.beepAndVibrate(startListening = true)
-                speechInput.startCommandListening()
+                // Esperamos 350ms tras el pitido para que el canal de audio quede libre antes de abrir el micrófono
+                mainHandler.postDelayed({
+                    speechInput.startCommandListening()
+                }, 350L)
             }
         } else {
             speaker.beepAndVibrate(startListening = true)
-            speechInput.startCommandListening()
+            // Esperamos 350ms tras el pitido para que el micrófono nunca choque con el sonido del beep
+            mainHandler.postDelayed({
+                speechInput.startCommandListening()
+            }, 350L)
         }
     }
 
     private fun handleUserSpokenText(userText: String) {
+        isListeningUiState = false
         speaker.beepAndVibrate(startListening = false)
 
         // ¿Estábamos esperando confirmación para enviar un mensaje de texto por WhatsApp?
@@ -89,7 +113,14 @@ class JarvisCoordinator private constructor(private val context: Context) {
         }
 
         scope.launch {
-            when (val decision = geminiAgent.interpretUserCommand(userText)) {
+            isProcessingUiState = true
+            val decision = try {
+                geminiAgent.interpretUserCommand(userText)
+            } finally {
+                isProcessingUiState = false
+            }
+
+            when (decision) {
                 is AgentDecision.SpeakOnly -> {
                     speaker.speak(decision.message)
                 }
@@ -124,7 +155,9 @@ class JarvisCoordinator private constructor(private val context: Context) {
                             "Le voy a mandar un WhatsApp a ${decision.recipientName} que dice: \"${decision.messageText}\". ¿Se lo mando? Decí sí o cancelar."
                         ) {
                             speaker.beepAndVibrate(startListening = true)
-                            speechInput.startCommandListening()
+                            mainHandler.postDelayed({
+                                speechInput.startCommandListening()
+                            }, 350L)
                         }
                     }
                 }

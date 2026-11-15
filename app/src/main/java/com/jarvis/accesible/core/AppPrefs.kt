@@ -14,21 +14,36 @@ object AppPrefs {
     private fun prefs(context: Context): SharedPreferences =
         context.applicationContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
 
+    /**
+     * Limpia espacios accidentales que el teclado de Android suele agregar al pegar una API Key.
+     */
+    fun sanitizeApiKeyInput(raw: String): String {
+        return raw
+            .replace("\u200B", "")
+            .split(",", ";", "\n")
+            .map { part -> part.replace("\\s+".toRegex(), "").trim() }
+            .filter { it.isNotEmpty() }
+            .joinToString(", ")
+    }
+
     fun getGeminiApiKey(context: Context): String =
         prefs(context).getString(KEY_GEMINI_API_KEY, "")?.trim() ?: ""
 
     /**
      * Permite colocar 1 sola clave o varias claves de distintas cuentas separadas por coma.
-     * Si una cuenta se queda sin cuota diaria, Jarvis rota automáticamente a la siguiente.
+     * Elimina cualquier espacio interno accidental para que la clave nunca quede mal guardada.
      */
     fun getGeminiApiKeyList(context: Context): List<String> =
         getGeminiApiKey(context)
-            .split(",", ";", "\n", " ")
-            .map { it.trim() }
+            .replace("\u200B", "")
+            .split(",", ";", "\n")
+            .map { it.replace("\\s+".toRegex(), "").trim() }
             .filter { it.isNotEmpty() }
 
     fun setGeminiApiKey(context: Context, apiKey: String) {
-        prefs(context).edit().putString(KEY_GEMINI_API_KEY, apiKey.trim()).apply()
+        val cleaned = sanitizeApiKeyInput(apiKey)
+        // Usamos commit() sincrónico para garantizar que quede guardada en el acto
+        prefs(context).edit().putString(KEY_GEMINI_API_KEY, cleaned).commit()
     }
 
     fun isWakeWordEnabled(context: Context): Boolean =

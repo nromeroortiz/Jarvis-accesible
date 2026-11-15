@@ -31,10 +31,11 @@ sealed class AgentDecision {
 }
 
 /**
- * Cliente para Google Gemini 2.5 Flash con:
- * 1. Function Calling (Herramientas para controlar WhatsApp, audios, llamadas, alarmas, YouTube y estado del celular).
- * 2. Búsqueda web en Google integrada (Google Search Grounding) para responder preguntas generales leídas en detalle.
- * 3. Intérprete local instantáneo de respaldo por si algún comando básico se dice sin conexión o antes de configurar la API Key.
+ * Cliente para Google Gemini (2.5 Flash / 2.0 Flash) con:
+ * 1. Limpieza automática de espacios en la API Key y verificador en vivo desde la pantalla de configuración.
+ * 2. Function Calling para WhatsApp, audios, llamadas, alarmas, YouTube, billetes y estado del celular.
+ * 3. Búsqueda web en Google integrada (Google Search Grounding).
+ * 4. Intérprete local instantáneo de respaldo (0 tokens) para comandos frecuentes.
  */
 class GeminiAgent(private val context: Context) {
 
@@ -43,6 +44,12 @@ class GeminiAgent(private val context: Context) {
         .readTimeout(25, TimeUnit.SECONDS)
         .build()
 
+    private val candidateModels = listOf(
+        "gemini-2.5-flash",
+        "gemini-2.0-flash",
+        "gemini-1.5-flash"
+    )
+
     private val systemPrompt = """
         Sos Jarvis, un asistente de voz personal en español rioplatense (Argentina), cálido, paciente y sumamente claro.
         Tu usuario es una persona mayor que no puede ver (es no vidente) y maneja su celular 100% por voz sin tocar la pantalla.
@@ -50,18 +57,73 @@ class GeminiAgent(private val context: Context) {
         REGLAS DE ORO:
         1. NUNCA le pidas que mire la pantalla, que toque un botón ni que abra un link. Vos sos sus ojos y sus manos.
         2. Cuando te pida buscar algo en internet o hacer una consulta general, dale la información completa, detallada y bien explicada para ser escuchada en voz alta. No uses formato Markdown ni asteriscos.
-        3. Si te pide realizar una acción del teléfono (revisar WhatsApp, reproducir audios recibidos, mandar un WhatsApp de texto, grabar un audio de voz para WhatsApp, llamar por teléfono, poner una alarma, poner música en YouTube, detener lo que está sonando o consultar hora/batería), invocá SIEMPRE la función correspondiente.
+        3. Si te pide realizar una acción del teléfono (revisar WhatsApp, reproducir audios recibidos, mandar un WhatsApp de texto, grabar un audio de voz para WhatsApp, llamar por teléfono, poner una alarma, poner música en YouTube, mirar qué billete tiene en la mano, detener lo que está sonando o consultar hora/batería), invocá SIEMPRE la función correspondiente.
     """.trimIndent()
 
+    /**
+     * Limpia espacios, guarda la clave en preferencias y realiza una prueba real contra Google Gemini
+     * para confirmar en pantalla que la clave funciona.
+     */
+    suspend fun verifyAndSaveApiKey(rawInput: String): Pair<Boolean, String> = withContext(Dispatchers.IO) {
+        AppPrefs.setGeminiApiKey(context, rawInput)
+        val keys = AppPrefs.getGeminiApiKeyList(context)
+        if (keys.isEmpty()) {
+            return@withContext Pair(false, "El campo está vacío. Pegá tu clave que empieza con AIza...")
+        }
+
+        val firstKey = keys.first()
+        if (!firstKey.startsWith("AIza") || firstKey.length < 35) {
+            return@withContext Pair(
+                false,
+                "La clave parece incompleta (debe empezar con 'AIza' y tener 39 letras/números sin espacios). Actual: ${firstKey.length} caracteres."
+            )
+        }
+
+        return@withContext try {
+            for (model in candidateModels) {
+                val url = "https://generativelanguage.googleapis.com/v1beta/models/$model:generateContent?key=$firstKey"
+                val payload = JSONObject().apply {
+                    put("contents", JSONArray().put(JSONObject().apply {
+                        put("role", "user")
+                        put("parts", JSONArray().put(JSONObject().put("text", "Respondé solo OK")))
+                    }))
+                }
+                val request = Request.Builder()
+                    .url(url)
+                    .post(payload.toString().toRequestBody("application/json; charset=utf-8".toMediaType()))
+                    .build()
+
+                client.newCall(request).execute().use { response ->
+                    if (response.isSuccessful) {
+                        return@withContext Pair(
+                            true,
+                            "🟢 ¡Clave guardada y verificada con éxito! (${keys.size} ${if (keys.size == 1) "cuenta lista" else "cuentas listas"})"
+                        )
+                    }
+                    val errBody = response.body?.string().orEmpty()
+                    if (errBody.contains("API_KEY_INVALID", ignoreCase = true)) {
+                        return@withContext Pair(
+                            false,
+                            "🔴 Google informa que la API Key no es válida. Copiala de nuevo desde Google AI Studio y tocá 'Pegar del portapapeles'."
+                        )
+                    }
+                }
+            }
+            Pair(false, "🔴 No se pudo validar la clave. Verificá que esté bien copiada de Google AI Studio.")
+        } catch (e: Exception) {
+            Pair(false, "🔴 No hay conexión a internet para verificar la clave en este momento, pero ya quedó guardada.")
+        }
+    }
+
     suspend fun interpretUserCommand(userText: String): AgentDecision = withContext(Dispatchers.IO) {
-        // Primero verificamos atajos directos súper rápidos que no necesitan esperar red
+        // 1. Atajos directos instantáneos (0 tokens y funcionan incluso sin configurar la clave)
         val localShortcut = tryFastLocalIntent(userText)
         if (localShortcut != null) return@withContext localShortcut
 
         val apiKeys = AppPrefs.getGeminiApiKeyList(context)
         if (apiKeys.isEmpty()) {
             return@withContext AgentDecision.SpeakOnly(
-                "Todavía falta colocar la clave gratuita de Google Gemini en la pantalla de configuración de Jarvis. Mientras tanto, igual podés pedirme: tengo algún mensaje, reproducí el audio, qué billete es este, qué hora es, o cuánta batería tengo."
+                "Todavía falta guardar la clave gratuita de Google Gemini en la configuración. Igual ya podés decirme: qué billete es este, tengo algún mensaje, reproducí el audio, llamá a un contacto, o qué hora es."
             )
         }
 
@@ -83,61 +145,58 @@ class GeminiAgent(private val context: Context) {
         }
     }
 
-    /**
-     * Si la pregunta requiere buscar información actualizada en Google (noticias, clima, resultados de fútbol, recetas, etc.),
-     * realiza una consulta con Google Search Grounding activado en Gemini 2.5 Flash.
-     */
     private fun callGeminiSearchGrounded(apiKey: String, query: String): String {
-        val url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=$apiKey"
+        for (model in candidateModels) {
+            val url = "https://generativelanguage.googleapis.com/v1beta/models/$model:generateContent?key=$apiKey"
 
-        val payload = JSONObject().apply {
-            put("system_instruction", JSONObject().apply {
-                put("parts", JSONArray().put(JSONObject().put("text", systemPrompt)))
-            })
-            put("contents", JSONArray().put(JSONObject().apply {
-                put("role", "user")
-                put("parts", JSONArray().put(JSONObject().put(
-                    "text",
-                    "Buscá información actualizada sobre esto y explicámelo en detalle pero de forma clara y conversacional para alguien que no puede ver la pantalla: $query"
-                )))
-            }))
-            put("tools", JSONArray().put(JSONObject().apply {
-                put("google_search", JSONObject())
-            }))
-        }
-
-        val request = Request.Builder()
-            .url(url)
-            .post(payload.toString().toRequestBody("application/json; charset=utf-8".toMediaType()))
-            .build()
-
-        client.newCall(request).execute().use { response ->
-            val bodyStr = response.body?.string() ?: return "No pude obtener la respuesta de Google en este momento."
-            if (!response.isSuccessful) {
-                return "No pude realizar la búsqueda en este momento."
+            val payload = JSONObject().apply {
+                put("system_instruction", JSONObject().apply {
+                    put("parts", JSONArray().put(JSONObject().put("text", systemPrompt)))
+                })
+                put("contents", JSONArray().put(JSONObject().apply {
+                    put("role", "user")
+                    put("parts", JSONArray().put(JSONObject().put(
+                        "text",
+                        "Buscá información actualizada sobre esto y explicámelo en detalle pero de forma clara y conversacional para alguien que no puede ver la pantalla: $query"
+                    )))
+                }))
+                put("tools", JSONArray().put(JSONObject().apply {
+                    put("google_search", JSONObject())
+                }))
             }
-            val json = JSONObject(bodyStr)
-            val parts = json.optJSONArray("candidates")
-                ?.optJSONObject(0)
-                ?.optJSONObject("content")
-                ?.optJSONArray("parts")
 
-            if (parts != null) {
-                val sb = StringBuilder()
-                for (i in 0 until parts.length()) {
-                    val text = parts.optJSONObject(i)?.optString("text", "") ?: ""
-                    if (text.isNotBlank()) sb.append(text).append(" ")
+            val request = Request.Builder()
+                .url(url)
+                .post(payload.toString().toRequestBody("application/json; charset=utf-8".toMediaType()))
+                .build()
+
+            try {
+                client.newCall(request).execute().use { response ->
+                    val bodyStr = response.body?.string() ?: return@use
+                    if (!response.isSuccessful) return@use
+                    val json = JSONObject(bodyStr)
+                    val parts = json.optJSONArray("candidates")
+                        ?.optJSONObject(0)
+                        ?.optJSONObject("content")
+                        ?.optJSONArray("parts")
+
+                    if (parts != null) {
+                        val sb = StringBuilder()
+                        for (i in 0 until parts.length()) {
+                            val text = parts.optJSONObject(i)?.optString("text", "") ?: ""
+                            if (text.isNotBlank()) sb.append(text).append(" ")
+                        }
+                        val result = sb.toString().trim()
+                        if (result.isNotEmpty()) return result
+                    }
                 }
-                val result = sb.toString().trim()
-                if (result.isNotEmpty()) return result
+            } catch (_: Exception) {
             }
-            return "No encontré resultados claros para esa búsqueda."
         }
+        return "No encontré resultados claros para esa búsqueda."
     }
 
     private fun callGeminiWithTools(apiKey: String, userText: String): AgentDecision {
-        val url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=$apiKey"
-
         val declarations = JSONArray()
             .put(tool("check_whatsapp_messages", "Revisa si hay mensajes nuevos o audios sin leer en WhatsApp"))
             .put(toolWithParams(
@@ -212,45 +271,67 @@ class GeminiAgent(private val context: Context) {
             }))
         }
 
-        val request = Request.Builder()
-            .url(url)
-            .post(payload.toString().toRequestBody("application/json; charset=utf-8".toMediaType()))
-            .build()
+        var sawInvalidKey = false
+        var sawQuotaExceeded = false
 
-        client.newCall(request).execute().use { response ->
-            val bodyStr = response.body?.string()
-                ?: return AgentDecision.SpeakOnly("No recibí respuesta del servidor.")
-            if (response.code == 429 || response.code == 403) {
-                return AgentDecision.SpeakOnly("CUOTA_AGOTADA")
-            }
-            if (!response.isSuccessful) {
-                return AgentDecision.SpeakOnly("Revisa que la clave de Gemini en la configuración sea correcta.")
-            }
+        for (model in candidateModels) {
+            val url = "https://generativelanguage.googleapis.com/v1beta/models/$model:generateContent?key=$apiKey"
+            val request = Request.Builder()
+                .url(url)
+                .post(payload.toString().toRequestBody("application/json; charset=utf-8".toMediaType()))
+                .build()
 
-            val json = JSONObject(bodyStr)
-            val parts = json.optJSONArray("candidates")
-                ?.optJSONObject(0)
-                ?.optJSONObject("content")
-                ?.optJSONArray("parts")
-                ?: return AgentDecision.SpeakOnly("No llegué a entenderte bien, ¿me lo repetís?")
+            client.newCall(request).execute().use { response ->
+                val bodyStr = response.body?.string().orEmpty()
+                if (response.code == 429) {
+                    sawQuotaExceeded = true
+                    return@use
+                }
+                if (!response.isSuccessful) {
+                    if (bodyStr.contains("API_KEY_INVALID", ignoreCase = true) || response.code == 400 || response.code == 403) {
+                        if (bodyStr.contains("API_KEY_INVALID", ignoreCase = true)) {
+                            sawInvalidKey = true
+                            return AgentDecision.SpeakOnly(
+                                "La clave de Gemini guardada tiene algún caracter mal copiado. Entrá a Configuración, tocá Pegar clave copiada y luego Guardar y Probar Clave."
+                            )
+                        }
+                    }
+                    return@use
+                }
 
-            for (i in 0 until parts.length()) {
-                val part = parts.optJSONObject(i) ?: continue
-                val fnCall = part.optJSONObject("functionCall")
-                if (fnCall != null) {
-                    val name = fnCall.optString("name")
-                    val args = fnCall.optJSONObject("args") ?: JSONObject()
-                    return mapFunctionCallToDecision(apiKey, name, args)
+                val json = JSONObject(bodyStr)
+                val parts = json.optJSONArray("candidates")
+                    ?.optJSONObject(0)
+                    ?.optJSONObject("content")
+                    ?.optJSONArray("parts")
+                    ?: return@use
+
+                for (i in 0 until parts.length()) {
+                    val part = parts.optJSONObject(i) ?: continue
+                    val fnCall = part.optJSONObject("functionCall")
+                    if (fnCall != null) {
+                        val name = fnCall.optString("name")
+                        val args = fnCall.optJSONObject("args") ?: JSONObject()
+                        return mapFunctionCallToDecision(apiKey, name, args)
+                    }
+                }
+
+                val spokenText = parts.optJSONObject(0)?.optString("text", "")?.trim() ?: ""
+                if (spokenText.isNotEmpty()) {
+                    return AgentDecision.SpeakOnly(spokenText)
                 }
             }
-
-            val spokenText = parts.optJSONObject(0)?.optString("text", "")?.trim() ?: ""
-            return if (spokenText.isNotEmpty()) {
-                AgentDecision.SpeakOnly(spokenText)
-            } else {
-                AgentDecision.SpeakOnly("¿Me podrías repetir qué necesitás?")
-            }
         }
+
+        if (sawQuotaExceeded) {
+            return AgentDecision.SpeakOnly("CUOTA_AGOTADA")
+        }
+        if (sawInvalidKey) {
+            return AgentDecision.SpeakOnly(
+                "La clave de Gemini no es válida. Entrá a Configuración y tocá Guardar y Probar Clave."
+            )
+        }
+        return AgentDecision.SpeakOnly("No llegué a entenderte bien, ¿me lo repetís?")
     }
 
     private fun mapFunctionCallToDecision(apiKey: String, name: String, args: JSONObject): AgentDecision {
@@ -297,9 +378,8 @@ class GeminiAgent(private val context: Context) {
     }
 
     /**
-     * Analiza la foto capturada por la cámara trasera usando Gemini 2.5 Flash Multimodal
-     * para reconocer billetes de Pesos Argentinos (10, 20, 50, 100, 200, 500, 1000, 2000, 10000, 20000)
-     * tanto por su número como por sus figuras (Hornero, San Martín, Yaguareté, Carrillo/Grierson, Belgrano, Alberdi, etc.).
+     * Analiza la foto capturada por la cámara trasera usando Gemini Multimodal
+     * para reconocer billetes de Pesos Argentinos (10, 20, 50, 100, 200, 500, 1000, 2000, 10000, 20000).
      */
     fun analyzeArgentineBanknote(jpegBytes: ByteArray): String? {
         val apiKeys = AppPrefs.getGeminiApiKeyList(context)
@@ -313,7 +393,6 @@ class GeminiAgent(private val context: Context) {
     }
 
     private fun analyzeArgentineBanknoteWithKey(apiKey: String, jpegBytes: ByteArray): String? {
-        val url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=$apiKey"
         val base64Image = Base64.encodeToString(jpegBytes, Base64.NO_WRAP)
 
         val visionPrompt = """
@@ -353,28 +432,31 @@ class GeminiAgent(private val context: Context) {
             }))
         }
 
-        val request = Request.Builder()
-            .url(url)
-            .post(payload.toString().toRequestBody("application/json; charset=utf-8".toMediaType()))
-            .build()
+        for (model in candidateModels) {
+            val url = "https://generativelanguage.googleapis.com/v1beta/models/$model:generateContent?key=$apiKey"
+            val request = Request.Builder()
+                .url(url)
+                .post(payload.toString().toRequestBody("application/json; charset=utf-8".toMediaType()))
+                .build()
 
-        return try {
-            client.newCall(request).execute().use { response ->
-                val bodyStr = response.body?.string() ?: return null
-                if (!response.isSuccessful) return null
-                val json = JSONObject(bodyStr)
-                val text = json.optJSONArray("candidates")
-                    ?.optJSONObject(0)
-                    ?.optJSONObject("content")
-                    ?.optJSONArray("parts")
-                    ?.optJSONObject(0)
-                    ?.optString("text", "")
-                    ?.trim()
-                if (!text.isNullOrBlank()) text else null
+            try {
+                client.newCall(request).execute().use { response ->
+                    val bodyStr = response.body?.string() ?: return@use
+                    if (!response.isSuccessful) return@use
+                    val json = JSONObject(bodyStr)
+                    val text = json.optJSONArray("candidates")
+                        ?.optJSONObject(0)
+                        ?.optJSONObject("content")
+                        ?.optJSONArray("parts")
+                        ?.optJSONObject(0)
+                        ?.optString("text", "")
+                        ?.trim()
+                    if (!text.isNullOrBlank()) return text
+                }
+            } catch (_: Exception) {
             }
-        } catch (_: Exception) {
-            null
         }
+        return null
     }
 
     private fun tryFastLocalIntent(rawText: String): AgentDecision? {
@@ -411,6 +493,8 @@ class GeminiAgent(private val context: Context) {
 
             text == "qué hora es" ||
                 text == "que hora es" ||
+                text.contains("qué hora es") ||
+                text.contains("que hora es") ||
                 text.contains("cuánta batería") ||
                 text.contains("cuanta bateria") ||
                 text.contains("está cargando") ||
@@ -425,6 +509,11 @@ class GeminiAgent(private val context: Context) {
                 text.contains("detené la música") ||
                 text.contains("pausá youtube") ||
                 text.contains("apagá la alarma") -> AgentDecision.StopPlaybackOrAlarm()
+
+            text.startsWith("llamá a ") || text.startsWith("llama a ") -> {
+                val contact = rawText.substring(8).trim()
+                if (contact.isNotEmpty()) AgentDecision.MakePhoneCall(contact) else null
+            }
 
             else -> null
         }

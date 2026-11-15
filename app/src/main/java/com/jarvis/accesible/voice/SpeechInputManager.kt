@@ -21,7 +21,8 @@ class SpeechInputManager(
     private val context: Context,
     private val onCommandRecognized: (String) -> Unit,
     private val onWakeWordDetected: (String?) -> Unit,
-    private val onListeningError: (Int) -> Unit
+    private val onListeningError: (Int) -> Unit,
+    private val onListeningStateChanged: ((Boolean) -> Unit)? = null
 ) {
     private val mainHandler = Handler(Looper.getMainLooper())
     private var speechRecognizer: SpeechRecognizer? = null
@@ -34,22 +35,32 @@ class SpeechInputManager(
     private var isWakeWordLoopActive: Boolean = false
 
     fun startCommandListening() {
+        startCommandListeningInternal(hasRetried = false)
+    }
+
+    private fun startCommandListeningInternal(hasRetried: Boolean) {
         mainHandler.post {
             isWakeWordLoopActive = false
             isActivelyListeningCommand = true
+            onListeningStateChanged?.invoke(true)
             destroyRecognizer()
 
             if (ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
                 isActivelyListeningCommand = false
+                onListeningStateChanged?.invoke(false)
                 onListeningError(-1)
                 return@post
             }
 
             if (!SpeechRecognizer.isRecognitionAvailable(context)) {
                 isActivelyListeningCommand = false
+                onListeningStateChanged?.invoke(false)
                 onListeningError(-1)
                 return@post
             }
+
+            val startTimestamp = System.currentTimeMillis()
+            var lastPartialText = ""
 
             speechRecognizer = SpeechRecognizer.createSpeechRecognizer(context.applicationContext).apply {
                 setRecognitionListener(object : RecognitionListener {
@@ -60,18 +71,55 @@ class SpeechInputManager(
 
                     override fun onEndOfSpeech() {
                         isActivelyListeningCommand = false
+                        onListeningStateChanged?.invoke(false)
+                    }
+
+                    override fun onPartialResults(partialResults: Bundle?) {
+                        val partial = partialResults
+                            ?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
+                            ?.firstOrNull()
+                            ?.trim()
+                        if (!partial.isNullOrEmpty()) {
+                            lastPartialText = partial
+                        }
                     }
 
                     override fun onError(error: Int) {
+                        val elapsed = System.currentTimeMillis() - startTimestamp
+
+                        // Si ya habíamos capturado texto parcial mientras hablaba y al final tiró timeout/no_match, usamos lo escuchado
+                        if (lastPartialText.isNotEmpty()) {
+                            isActivelyListeningCommand = false
+                            onListeningStateChanged?.invoke(false)
+                            val recognized = lastPartialText
+                            lastPartialText = ""
+                            onCommandRecognized(recognized)
+                            scheduleWakeWordResumeIfEnabled()
+                            return
+                        }
+
+                        // Si el reconocedor dio un error instantáneo al abrir (<1.5s, ej. ERROR_CLIENT o ERROR_RECOGNIZER_BUSY),
+                        // reintentamos automáticamente una vez tras 350ms sin molestar al usuario diciendo "No llegué a escucharte".
+                        if (!hasRetried && elapsed < 1500L) {
+                            mainHandler.postDelayed({
+                                startCommandListeningInternal(hasRetried = true)
+                            }, 350L)
+                            return
+                        }
+
                         isActivelyListeningCommand = false
+                        onListeningStateChanged?.invoke(false)
                         onListeningError(error)
                         scheduleWakeWordResumeIfEnabled()
                     }
 
                     override fun onResults(results: Bundle?) {
                         isActivelyListeningCommand = false
+                        onListeningStateChanged?.invoke(false)
                         val matches = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
-                        val bestText = matches?.firstOrNull()?.trim() ?: ""
+                        val bestText = matches?.firstOrNull()?.trim().orEmpty().ifEmpty { lastPartialText }
+                        lastPartialText = ""
+
                         if (bestText.isNotEmpty()) {
                             onCommandRecognized(bestText)
                         } else {
@@ -80,25 +128,26 @@ class SpeechInputManager(
                         scheduleWakeWordResumeIfEnabled()
                     }
 
-                    override fun onPartialResults(partialResults: Bundle?) {}
                     override fun onEvent(eventType: Int, params: Bundle?) {}
                 })
             }
 
+            // Intent limpio y compatible con todos los teléfonos Android 10 a 15
+            // (sin EXTRA_SPEECH_INPUT_*_SILENCE_LENGTH_MILLIS que en Google Speech Services moderno corta la escucha al instante)
             val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
                 putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
                 putExtra(RecognizerIntent.EXTRA_LANGUAGE, "es-AR")
-                putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, false)
-                // Pausas amplias para que una persona mayor pueda hablar tranquila sin que se corte
-                putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 2200L)
-                putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS, 1800L)
-                putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_MINIMUM_LENGTH_MILLIS, 1500L)
+                putExtra(RecognizerIntent.EXTRA_LANGUAGE_PREFERENCE, "es-AR")
+                putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
+                putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 3)
+                putExtra(RecognizerIntent.EXTRA_CALLING_PACKAGE, context.packageName)
             }
 
             try {
                 speechRecognizer?.startListening(intent)
             } catch (_: Exception) {
                 isActivelyListeningCommand = false
+                onListeningStateChanged?.invoke(false)
                 onListeningError(SpeechRecognizer.ERROR_CLIENT)
             }
         }
@@ -119,6 +168,7 @@ class SpeechInputManager(
         mainHandler.post {
             isActivelyListeningCommand = false
             isWakeWordLoopActive = false
+            onListeningStateChanged?.invoke(false)
             destroyRecognizer()
         }
     }
@@ -159,7 +209,6 @@ class SpeechInputManager(
                     val wakeWord = AppPrefs.getWakeWordPhrase(context)
 
                     if (heard.contains(wakeWord) || heard.contains("jarvis") || heard.contains("asistente")) {
-                        // Si ya dijo el pedido completo (ej. "Hola Jarvis tengo algún mensaje"), extraemos el comando
                         val remaining = heard
                             .replace("hola $wakeWord", "")
                             .replace("hola jarvis", "")
@@ -182,7 +231,8 @@ class SpeechInputManager(
         val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
             putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
             putExtra(RecognizerIntent.EXTRA_LANGUAGE, "es-AR")
-            putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, false)
+            putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
+            putExtra(RecognizerIntent.EXTRA_CALLING_PACKAGE, context.packageName)
         }
 
         try {
