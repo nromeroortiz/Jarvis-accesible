@@ -1,13 +1,16 @@
 package com.jarvis.accesible.voice
 
+import android.Manifest
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.speech.RecognitionListener
 import android.speech.RecognizerIntent
 import android.speech.SpeechRecognizer
+import androidx.core.content.ContextCompat
 import com.jarvis.accesible.core.AppPrefs
 
 /**
@@ -35,6 +38,12 @@ class SpeechInputManager(
             isWakeWordLoopActive = false
             isActivelyListeningCommand = true
             destroyRecognizer()
+
+            if (ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+                isActivelyListeningCommand = false
+                onListeningError(-1)
+                return@post
+            }
 
             if (!SpeechRecognizer.isRecognitionAvailable(context)) {
                 isActivelyListeningCommand = false
@@ -124,6 +133,7 @@ class SpeechInputManager(
 
     private fun startWakeWordSingleCycle() {
         if (isActivelyListeningCommand || !AppPrefs.isWakeWordEnabled(context)) return
+        if (ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) return
         isWakeWordLoopActive = true
         destroyRecognizer()
 

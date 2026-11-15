@@ -1,5 +1,6 @@
 package com.jarvis.accesible.services
 
+import android.Manifest
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
@@ -7,9 +8,12 @@ import android.app.PendingIntent
 import android.app.Service
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
+import android.content.pm.ServiceInfo
 import android.os.Build
 import android.os.IBinder
 import androidx.core.app.NotificationCompat
+import androidx.core.content.ContextCompat
 import com.jarvis.accesible.core.JarvisCoordinator
 import com.jarvis.accesible.ui.MainActivity
 
@@ -21,14 +25,53 @@ class JarvisForegroundService : Service() {
 
     override fun onCreate() {
         super.onCreate()
+        if (!hasMicrophonePermission(this)) {
+            stopSelf()
+            return
+        }
         createNotificationChannel()
-        startForeground(NOTIFICATION_ID, buildNotification())
-        JarvisCoordinator.getInstance(applicationContext).speechInput.syncWakeWordLoop()
+        if (!startForegroundSafely()) {
+            stopSelf()
+            return
+        }
+        try {
+            JarvisCoordinator.getInstance(applicationContext).speechInput.syncWakeWordLoop()
+        } catch (_: Throwable) {
+        }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        JarvisCoordinator.getInstance(applicationContext).speechInput.syncWakeWordLoop()
+        if (!hasMicrophonePermission(this)) {
+            stopSelf()
+            return START_NOT_STICKY
+        }
+        if (!startForegroundSafely()) {
+            stopSelf()
+            return START_NOT_STICKY
+        }
+        try {
+            JarvisCoordinator.getInstance(applicationContext).speechInput.syncWakeWordLoop()
+        } catch (_: Throwable) {
+        }
         return START_STICKY
+    }
+
+    private fun startForegroundSafely(): Boolean {
+        return try {
+            val notification = buildNotification()
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                startForeground(
+                    NOTIFICATION_ID,
+                    notification,
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
+                )
+            } else {
+                startForeground(NOTIFICATION_ID, notification)
+            }
+            true
+        } catch (_: Throwable) {
+            false
+        }
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
@@ -71,15 +114,27 @@ class JarvisForegroundService : Service() {
         private const val CHANNEL_ID = "jarvis_accesible_channel"
         private const val NOTIFICATION_ID = 1001
 
+        fun hasMicrophonePermission(context: Context): Boolean {
+            return ContextCompat.checkSelfPermission(
+                context,
+                Manifest.permission.RECORD_AUDIO
+            ) == PackageManager.PERMISSION_GRANTED
+        }
+
         fun startServiceIfPossible(context: Context) {
             try {
+                // En Android 14/15 (API 34+), iniciar un ForegroundService de tipo micrófono
+                // antes de otorgar el permiso RECORD_AUDIO lanza SecurityException.
+                // Por eso solo lo iniciamos una vez concedido el permiso de micrófono.
+                if (!hasMicrophonePermission(context)) return
+
                 val intent = Intent(context.applicationContext, JarvisForegroundService::class.java)
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                     context.applicationContext.startForegroundService(intent)
                 } else {
                     context.applicationContext.startService(intent)
                 }
-            } catch (_: Exception) {
+            } catch (_: Throwable) {
             }
         }
     }

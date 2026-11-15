@@ -37,8 +37,9 @@ import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
@@ -46,7 +47,6 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
@@ -54,8 +54,6 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
-import androidx.lifecycle.Lifecycle
-import androidx.lifecycle.LifecycleEventObserver
 import com.jarvis.accesible.core.AppPrefs
 import com.jarvis.accesible.core.JarvisCoordinator
 import com.jarvis.accesible.services.JarvisAccessibilityService
@@ -63,35 +61,47 @@ import com.jarvis.accesible.services.JarvisForegroundService
 
 class MainActivity : ComponentActivity() {
 
+    private var resumeTrigger by mutableIntStateOf(0)
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         JarvisForegroundService.startServiceIfPossible(this)
 
         // Si se invocó como asistente predeterminado del sistema (manteniendo botón inicio/encendido), escucha directo
-        if (intent?.action == Intent.ACTION_ASSIST) {
+        if (intent?.action == Intent.ACTION_ASSIST && checkRuntimePermissions(this)) {
             JarvisCoordinator.getInstance(this).triggerHandsFreeListening(greetBeforeListening = false)
         }
 
         setContent {
             MaterialTheme {
-                JarvisMainScreen()
+                JarvisMainScreen(resumeKey = resumeTrigger)
             }
         }
     }
 
+    override fun onResume() {
+        super.onResume()
+        resumeTrigger++
+        JarvisForegroundService.startServiceIfPossible(this)
+    }
+
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
-        if (intent.action == Intent.ACTION_ASSIST) {
+        if (intent.action == Intent.ACTION_ASSIST && checkRuntimePermissions(this)) {
             JarvisCoordinator.getInstance(this).triggerHandsFreeListening(greetBeforeListening = false)
         }
     }
 }
 
 @Composable
-fun JarvisMainScreen() {
+fun JarvisMainScreen(resumeKey: Int) {
     val context = LocalContext.current
     val coordinator = remember { JarvisCoordinator.getInstance(context) }
-    var showSetupPanel by remember { mutableStateOf(false) }
+
+    // Si todavía falta configurar permisos o la clave de Gemini, abre directo el panel de Configuración
+    var showSetupPanel by remember {
+        mutableStateOf(!checkRuntimePermissions(context) || AppPrefs.getGeminiApiKey(context).isBlank())
+    }
 
     var apiKey by remember { mutableStateOf(AppPrefs.getGeminiApiKey(context)) }
     var wakeWordEnabled by remember { mutableStateOf(AppPrefs.isWakeWordEnabled(context)) }
@@ -103,26 +113,19 @@ fun JarvisMainScreen() {
     var isBatteryOk by remember { mutableStateOf(checkBatteryOptimizationIgnored(context)) }
     var isRuntimePermsOk by remember { mutableStateOf(checkRuntimePermissions(context)) }
 
+    LaunchedEffect(resumeKey) {
+        isAccessibilityOk = checkAccessibilityEnabled(context)
+        isNotificationOk = checkNotificationListenerEnabled(context)
+        isAllFilesOk = checkAllFilesPermission()
+        isBatteryOk = checkBatteryOptimizationIgnored(context)
+        isRuntimePermsOk = checkRuntimePermissions(context)
+    }
+
     val permissionLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.RequestMultiplePermissions()
     ) {
         isRuntimePermsOk = checkRuntimePermissions(context)
         JarvisForegroundService.startServiceIfPossible(context)
-    }
-
-    val lifecycleOwner = LocalLifecycleOwner.current
-    DisposableEffect(lifecycleOwner) {
-        val observer = LifecycleEventObserver { _, event ->
-            if (event == Lifecycle.Event.ON_RESUME) {
-                isAccessibilityOk = checkAccessibilityEnabled(context)
-                isNotificationOk = checkNotificationListenerEnabled(context)
-                isAllFilesOk = checkAllFilesPermission()
-                isBatteryOk = checkBatteryOptimizationIgnored(context)
-                isRuntimePermsOk = checkRuntimePermissions(context)
-            }
-        }
-        lifecycleOwner.lifecycle.addObserver(observer)
-        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
     }
 
     Column(
@@ -168,7 +171,11 @@ fun JarvisMainScreen() {
                             "Hablar con el asistente Jarvis. Tocá cualquier parte de la pantalla o presioná dos veces el botón de Subir Volumen."
                     }
                     .clickable {
-                        coordinator.triggerHandsFreeListening(greetBeforeListening = false)
+                        if (!checkRuntimePermissions(context)) {
+                            showSetupPanel = true
+                        } else {
+                            coordinator.triggerHandsFreeListening(greetBeforeListening = false)
+                        }
                     }
                     .padding(24.dp),
                 contentAlignment = Alignment.Center
@@ -344,7 +351,7 @@ fun JarvisMainScreen() {
                             title = "B. Servicio de Accesibilidad (Botón físico y clic automático en WhatsApp)",
                             isGranted = isAccessibilityOk,
                             onClick = {
-                                context.startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
+                                safeStartSettings(context, Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
                             }
                         )
 
@@ -352,7 +359,7 @@ fun JarvisMainScreen() {
                             title = "C. Lector de Notificaciones (Leer y responder WhatsApp)",
                             isGranted = isNotificationOk,
                             onClick = {
-                                context.startActivity(Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS))
+                                safeStartSettings(context, Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS))
                             }
                         )
 
@@ -365,7 +372,11 @@ fun JarvisMainScreen() {
                                         Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION,
                                         Uri.parse("package:${context.packageName}")
                                     )
-                                    context.startActivity(intent)
+                                    safeStartSettings(
+                                        context,
+                                        intent,
+                                        Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION)
+                                    )
                                 }
                             }
                         )
@@ -378,7 +389,11 @@ fun JarvisMainScreen() {
                                     Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
                                     Uri.parse("package:${context.packageName}")
                                 )
-                                context.startActivity(intent)
+                                safeStartSettings(
+                                    context,
+                                    intent,
+                                    Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS)
+                                )
                             }
                         )
                     }
@@ -412,45 +427,88 @@ private fun PermissionRow(title: String, isGranted: Boolean, onClick: () -> Unit
     }
 }
 
+private fun safeStartSettings(context: Context, primary: Intent, fallback: Intent? = null) {
+    try {
+        context.startActivity(primary)
+    } catch (_: Throwable) {
+        if (fallback != null) {
+            try {
+                context.startActivity(fallback)
+                return
+            } catch (_: Throwable) {
+            }
+        }
+        try {
+            context.startActivity(
+                Intent(
+                    Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                    Uri.parse("package:${context.packageName}")
+                )
+            )
+        } catch (_: Throwable) {
+        }
+    }
+}
+
 private fun checkAccessibilityEnabled(context: Context): Boolean {
-    if (JarvisAccessibilityService.instance != null) return true
-    val expected = "${context.packageName}/${JarvisAccessibilityService::class.java.canonicalName}"
-    val enabledServices = Settings.Secure.getString(
-        context.contentResolver,
-        Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES
-    ) ?: return false
-    return enabledServices.contains(expected) || enabledServices.contains(context.packageName)
+    return try {
+        if (JarvisAccessibilityService.instance != null) return true
+        val expected = "${context.packageName}/${JarvisAccessibilityService::class.java.canonicalName}"
+        val enabledServices = Settings.Secure.getString(
+            context.contentResolver,
+            Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES
+        ) ?: return false
+        enabledServices.contains(expected) || enabledServices.contains(context.packageName)
+    } catch (_: Throwable) {
+        false
+    }
 }
 
 private fun checkNotificationListenerEnabled(context: Context): Boolean {
-    val flat = Settings.Secure.getString(
-        context.contentResolver,
-        "enabled_notification_listeners"
-    ) ?: return false
-    return flat.contains(context.packageName)
+    return try {
+        val flat = Settings.Secure.getString(
+            context.contentResolver,
+            "enabled_notification_listeners"
+        ) ?: return false
+        flat.contains(context.packageName)
+    } catch (_: Throwable) {
+        false
+    }
 }
 
 private fun checkAllFilesPermission(): Boolean {
-    return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-        Environment.isExternalStorageManager()
-    } else {
-        true
+    return try {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            Environment.isExternalStorageManager()
+        } else {
+            true
+        }
+    } catch (_: Throwable) {
+        false
     }
 }
 
 private fun checkBatteryOptimizationIgnored(context: Context): Boolean {
-    val pm = context.getSystemService(Context.POWER_SERVICE) as PowerManager
-    return pm.isIgnoringBatteryOptimizations(context.packageName)
+    return try {
+        val pm = context.getSystemService(Context.POWER_SERVICE) as PowerManager
+        pm.isIgnoringBatteryOptimizations(context.packageName)
+    } catch (_: Throwable) {
+        false
+    }
 }
 
 private fun checkRuntimePermissions(context: Context): Boolean {
-    val required = listOf(
-        Manifest.permission.RECORD_AUDIO,
-        Manifest.permission.CAMERA,
-        Manifest.permission.READ_CONTACTS,
-        Manifest.permission.CALL_PHONE
-    )
-    return required.all {
-        ContextCompat.checkSelfPermission(context, it) == PackageManager.PERMISSION_GRANTED
+    return try {
+        val required = listOf(
+            Manifest.permission.RECORD_AUDIO,
+            Manifest.permission.CAMERA,
+            Manifest.permission.READ_CONTACTS,
+            Manifest.permission.CALL_PHONE
+        )
+        required.all {
+            ContextCompat.checkSelfPermission(context, it) == PackageManager.PERMISSION_GRANTED
+        }
+    } catch (_: Throwable) {
+        false
     }
 }

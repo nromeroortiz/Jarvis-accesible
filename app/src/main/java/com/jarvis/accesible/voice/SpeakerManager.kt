@@ -33,7 +33,10 @@ class SpeakerManager(private val context: Context) : TextToSpeech.OnInitListener
         private set
 
     init {
-        tts = TextToSpeech(context.applicationContext, this)
+        try {
+            tts = TextToSpeech(context.applicationContext, this)
+        } catch (_: Throwable) {
+        }
     }
 
     override fun onInit(status: Int) {
