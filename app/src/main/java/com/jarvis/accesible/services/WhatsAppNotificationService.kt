@@ -55,6 +55,7 @@ class WhatsAppNotificationService : NotificationListenerService() {
         }
 
         WhatsAppRepository.addIncomingNotification(
+            context = applicationContext,
             sender = rawTitle,
             text = rawText,
             replyIntent = replyPendingIntent,

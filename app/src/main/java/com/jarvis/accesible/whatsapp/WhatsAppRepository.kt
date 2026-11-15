@@ -18,8 +18,13 @@ import android.os.Looper
 import android.provider.ContactsContract
 import androidx.core.content.FileProvider
 import com.jarvis.accesible.services.JarvisAccessibilityService
+import org.json.JSONArray
+import org.json.JSONObject
 import java.io.File
 import java.text.Normalizer
+import java.text.SimpleDateFormat
+import java.util.Calendar
+import java.util.Date
 import java.util.Locale
 import java.util.concurrent.CopyOnWriteArrayList
 
@@ -29,37 +34,105 @@ data class WhatsAppIncomingMessage(
     val text: String,
     val isVoiceNote: Boolean,
     val timestamp: Long,
-    val replyPendingIntent: PendingIntent?,
-    val remoteInputs: Array<RemoteInput>?,
-    val associatedAudioFile: File? = null,
+    val replyPendingIntent: PendingIntent? = null,
+    val remoteInputs: Array<RemoteInput>? = null,
+    val associatedAudioPath: String? = null,
     var isReadByUncle: Boolean = false
 )
 
 /**
- * Gestiona toda la interacción con WhatsApp de forma rápida y flexible:
- * 1. Almacena mensajes y notas de voz entrantes asociando el archivo .opus a la persona que lo envió.
- * 2. Busca los audios .opus únicamente en las 2 carpetas semanales más recientes (tarda <20ms en lugar de varios segundos).
- * 3. Permite reproducir el último audio, el anterior/penúltimo, repetir el actual, reproducir varios seguidos,
- *    o abrir directamente el chat de un contacto específico (ej. "Nico") y darle Play al audio deseado.
+ * Gestiona toda la interacción con WhatsApp:
+ * - Guarda un historial persistente de mensajes (incluso ya leídos) para poder pedir "mensajes de hoy", "de ayer", "de X persona".
+ * - Permite reproducir listas de audios por día ("audios de hoy", "audios de ayer") y navegar con "Siguiente" y "Anterior".
+ * - Permite leer en voz alta los mensajes ya vistos dentro del chat abierto en pantalla de cualquier contacto.
  */
 object WhatsAppRepository {
 
     private val messages = CopyOnWriteArrayList<WhatsAppIncomingMessage>()
+    private var isHistoryLoaded = false
     private var mediaPlayer: MediaPlayer? = null
     private var mediaRecorder: MediaRecorder? = null
     private var currentRecordingFile: File? = null
     private val mainHandler = Handler(Looper.getMainLooper())
 
-    // Puntero para poder decir "reproducí el audio anterior" o "repetilo"
+    // Cola activa de navegación para que el tío pueda decir "Siguiente" o "Anterior"
+    private enum class NavMode { AUDIO_LIST, CHAT_AUDIO, MESSAGE_LIST }
+
     @Volatile
-    private var currentAudioIndex: Int = 0
+    private var currentNavMode: NavMode = NavMode.AUDIO_LIST
+
+    private var activeAudioPlaylist: List<File> = emptyList()
+
+    @Volatile
+    private var activeAudioIndex: Int = 0
+
+    private var activeMessagePlaylist: List<String> = emptyList()
+
+    @Volatile
+    private var activeMessageIndex: Int = 0
+
+    @Volatile
+    private var activeChatSender: String? = null
+
+    @Volatile
+    private var activeChatAudioOffset: Int = 1
+
+    fun ensureHistoryLoaded(context: Context) {
+        if (isHistoryLoaded) return
+        isHistoryLoaded = true
+        try {
+            val file = File(context.filesDir, "whatsapp_history.json")
+            if (!file.exists()) return
+            val arr = JSONArray(file.readText())
+            val cutoff = System.currentTimeMillis() - 14L * 24L * 3600L * 1000L
+            for (i in 0 until arr.length()) {
+                val obj = arr.optJSONObject(i) ?: continue
+                val ts = obj.optLong("timestamp", 0L)
+                if (ts < cutoff) continue
+                messages.add(
+                    WhatsAppIncomingMessage(
+                        id = obj.optString("id"),
+                        senderName = obj.optString("senderName"),
+                        text = obj.optString("text"),
+                        isVoiceNote = obj.optBoolean("isVoiceNote"),
+                        timestamp = ts,
+                        associatedAudioPath = obj.optString("associatedAudioPath").ifBlank { null },
+                        isReadByUncle = obj.optBoolean("isReadByUncle", false)
+                    )
+                )
+            }
+        } catch (_: Exception) {
+        }
+    }
+
+    private fun saveHistoryToDisk(context: Context) {
+        try {
+            val arr = JSONArray()
+            val recent = messages.takeLast(150)
+            for (m in recent) {
+                arr.put(JSONObject().apply {
+                    put("id", m.id)
+                    put("senderName", m.senderName)
+                    put("text", m.text)
+                    put("isVoiceNote", m.isVoiceNote)
+                    put("timestamp", m.timestamp)
+                    put("associatedAudioPath", m.associatedAudioPath ?: "")
+                    put("isReadByUncle", m.isReadByUncle)
+                })
+            }
+            File(context.filesDir, "whatsapp_history.json").writeText(arr.toString())
+        } catch (_: Exception) {
+        }
+    }
 
     fun addIncomingNotification(
+        context: Context,
         sender: String,
         text: String,
         replyIntent: PendingIntent?,
         remoteInputs: Array<RemoteInput>?
     ) {
+        ensureHistoryLoaded(context)
         val cleanSender = sender.trim()
         val cleanText = text.trim()
         if (cleanSender.isEmpty() || cleanText.isEmpty()) return
@@ -97,20 +170,27 @@ object WhatsAppRepository {
                 timestamp = now,
                 replyPendingIntent = replyIntent,
                 remoteInputs = remoteInputs,
-                associatedAudioFile = latestFile,
+                associatedAudioPath = latestFile?.absolutePath,
                 isReadByUncle = false
             )
         )
+        saveHistoryToDisk(context)
     }
 
-    /**
-     * Resumen corto y al grano de los mensajes nuevos.
-     */
-    fun getUnreadSummary(): String {
+    fun getUnreadSummary(context: Context): String {
+        ensureHistoryLoaded(context)
         val unread = messages.filter { !it.isReadByUncle }
         if (unread.isEmpty()) {
             return "No tenés mensajes nuevos."
         }
+
+        // También armamos la cola de lectura por si dice "Siguiente" o "Anterior"
+        activeMessagePlaylist = unread.reversed().map { msg ->
+            if (msg.isVoiceNote) "${msg.senderName} mandó un audio."
+            else "${msg.senderName} dijo: ${msg.text}."
+        }
+        activeMessageIndex = 0
+        currentNavMode = NavMode.MESSAGE_LIST
 
         val grouped = unread.groupBy { it.senderName }
         val sb = StringBuilder()
@@ -121,11 +201,7 @@ object WhatsAppRepository {
             val textMsgs = list.filter { !it.isVoiceNote }
 
             if (audioCount > 0 && textMsgs.isEmpty()) {
-                if (audioCount == 1) {
-                    sb.append("$sender mandó un audio.")
-                } else {
-                    sb.append("$sender mandó $audioCount audios.")
-                }
+                sb.append(if (audioCount == 1) "$sender mandó un audio." else "$sender mandó $audioCount audios.")
             } else if (audioCount > 0 && textMsgs.isNotEmpty()) {
                 sb.append("$sender mandó $audioCount audio y dijo: ${textMsgs.joinToString(". ") { it.text }}.")
             } else {
@@ -134,45 +210,266 @@ object WhatsAppRepository {
 
             list.forEach { it.isReadByUncle = true }
         }
+        saveHistoryToDisk(context)
         return sb.toString().trim()
     }
 
-    fun getMessagesFromSender(context: Context, senderQuery: String): String {
-        val normQuery = normalizeText(senderQuery)
-        val matching = messages.filter {
-            normalizeText(it.senderName).contains(normQuery) ||
-                normQuery.contains(normalizeText(it.senderName))
-        }.takeLast(4)
+    /**
+     * Lee mensajes de una persona o de un día ("hoy", "ayer", "hoy y ayer") INCLUSO SI YA FUERON LEÍDOS.
+     * Permite luego decir "Siguiente" y "Anterior" para pasar uno por uno.
+     */
+    fun readMessagesByFilter(
+        context: Context,
+        senderQuery: String?,
+        dayFilter: String?, // "hoy", "ayer", "ambos", o null
+        onAsyncScreenRead: (String) -> Unit
+    ): String {
+        ensureHistoryLoaded(context)
+        val normSender = senderQuery?.let { normalizeText(it) }
 
-        if (matching.isNotEmpty()) {
-            val senderReal = matching.last().senderName
-            val sb = StringBuilder("$senderReal: ")
-            matching.forEach { msg ->
-                msg.isReadByUncle = true
-                if (msg.isVoiceNote) {
-                    sb.append("mandó un audio. ")
-                } else {
-                    sb.append("${msg.text}. ")
-                }
+        val filtered = messages.filter { msg ->
+            val matchesSender = if (normSender.isNullOrBlank()) {
+                true
+            } else {
+                val s = normalizeText(msg.senderName)
+                s.contains(normSender) || normSender.contains(s)
             }
-            return sb.toString().trim()
+            val matchesDay = matchesDaySpec(msg.timestamp, dayFilter)
+            matchesSender && matchesDay
+        }.sortedByDescending { it.timestamp }
+
+        if (filtered.isNotEmpty()) {
+            val timeFmt = SimpleDateFormat("HH:mm", Locale.getDefault())
+            activeMessagePlaylist = filtered.map { msg ->
+                val hr = timeFmt.format(Date(msg.timestamp))
+                if (msg.isVoiceNote) "${msg.senderName} a las $hr mandó un audio."
+                else "${msg.senderName} a las $hr dijo: ${msg.text}."
+            }
+            activeMessageIndex = 0
+            currentNavMode = NavMode.MESSAGE_LIST
+
+            filtered.forEach { it.isReadByUncle = true }
+            saveHistoryToDisk(context)
+
+            val firstItem = activeMessagePlaylist.first()
+            val total = activeMessagePlaylist.size
+            return if (total > 1) {
+                "Mensaje 1 de $total: $firstItem Decí siguiente para escuchar el otro."
+            } else {
+                firstItem
+            }
         }
 
-        // Si no había notificaciones recientes guardadas, abrimos directamente el chat de ese contacto
-        val contact = findContactByName(context, senderQuery)
-        if (contact != null) {
-            openWhatsAppChat(context, contact.second)
-            return "Abriendo el chat de ${contact.first}."
+        // Si pidió de una persona específica y esos mensajes llegaron antes de instalar Jarvis,
+        // abrimos su chat en WhatsApp y leemos las burbujas visibles directamente de la pantalla.
+        if (!senderQuery.isNullOrBlank()) {
+            val contact = findContactByName(context, senderQuery)
+            if (contact != null) {
+                JarvisAccessibilityService.requestReadVisibleChatInWhatsApp { screenTexts ->
+                    val recentTexts = screenTexts.reversed()
+                    activeMessagePlaylist = recentTexts.map { "${contact.first} dijo: $it" }
+                    activeMessageIndex = 0
+                    currentNavMode = NavMode.MESSAGE_LIST
+                    val first = activeMessagePlaylist.firstOrNull()
+                    if (first != null) {
+                        onAsyncScreenRead("$first. Decí siguiente o anterior para recorrer el chat.")
+                    }
+                }
+                openWhatsAppChat(context, contact.second)
+                return "Abriendo y leyendo el chat de ${contact.first}."
+            }
         }
 
-        return "No hay mensajes recientes de $senderQuery."
+        return "No encontré mensajes guardados para ese filtro."
     }
 
     /**
-     * Obtiene los archivos de audio (.opus) más recientes en menos de 20 milisegundos
-     * revisando únicamente las 2 subcarpetas semanales más nuevas de WhatsApp.
+     * Reproduce los audios de un día ("hoy", "ayer", etc.) o de una persona, y habilita decir "Siguiente" o "Anterior".
      */
-    private fun getRecentOpusFilesFast(limit: Int = 25): List<File> {
+    fun playWhatsAppVoiceNoteFlexible(
+        context: Context,
+        senderHint: String? = null,
+        whichOffset: Int = 1,
+        dayFilter: String? = null,
+        stepNext: Boolean = false,
+        stepPrevious: Boolean = false,
+        repeatCurrent: Boolean = false,
+        forceOpenChat: Boolean = false,
+        onFinished: (Boolean, String) -> Unit
+    ) {
+        stopAudioPlayback()
+
+        // 1. Si el usuario dijo "Siguiente", "Anterior" o "Repetir" sobre lo que estaba escuchando
+        if (stepNext || stepPrevious || repeatCurrent) {
+            handleStepNavigation(context, stepNext, stepPrevious, repeatCurrent, onFinished)
+            return
+        }
+
+        // 2. Si pidió explícitamente los audios de un contacto (ej. "reproducí el último audio de Nico")
+        if (!senderHint.isNullOrBlank()) {
+            val contact = findContactByName(context, senderHint)
+            if (contact != null) {
+                activeChatSender = contact.first
+                activeChatAudioOffset = whichOffset.coerceAtLeast(1)
+                currentNavMode = NavMode.CHAT_AUDIO
+                JarvisAccessibilityService.requestAutoPlayVoiceNoteInWhatsApp(offsetFromBottom = activeChatAudioOffset)
+                openWhatsAppChat(context, contact.second)
+                return
+            }
+        }
+
+        // 3. Buscamos los archivos .opus filtrando por día si pidió "audios de hoy", "audios de ayer", etc.
+        val allRecent = getRecentOpusFilesFast(limit = 60)
+        val filteredFiles = if (!dayFilter.isNullOrBlank()) {
+            allRecent.filter { matchesDaySpec(it.lastModified(), dayFilter) }
+        } else {
+            allRecent
+        }
+
+        if (filteredFiles.isNotEmpty()) {
+            activeAudioPlaylist = filteredFiles
+            activeAudioIndex = (whichOffset - 1).coerceIn(0, filteredFiles.lastIndex)
+            currentNavMode = NavMode.AUDIO_LIST
+            playSingleAudioFile(activeAudioPlaylist[activeAudioIndex], onFinished)
+            return
+        }
+
+        val noAudioMsg = if (!dayFilter.isNullOrBlank()) {
+            "No encontré audios de $dayFilter."
+        } else {
+            "No encontré audios de WhatsApp."
+        }
+        onFinished(false, noAudioMsg)
+    }
+
+    /**
+     * Avanza ("Siguiente") o retrocede ("Anterior") tanto en listas de audios como en listas de mensajes.
+     */
+    fun stepActiveQueue(
+        context: Context,
+        isNext: Boolean,
+        isRepeat: Boolean,
+        onSpeakMessage: (String) -> Unit
+    ) {
+        stopAudioPlayback()
+
+        when (currentNavMode) {
+            NavMode.MESSAGE_LIST -> {
+                if (activeMessagePlaylist.isEmpty()) {
+                    onSpeakMessage("No hay más mensajes en la lista.")
+                    return
+                }
+                activeMessageIndex = when {
+                    isRepeat -> activeMessageIndex.coerceIn(0, activeMessagePlaylist.lastIndex)
+                    isNext -> (activeMessageIndex + 1)
+                    else -> (activeMessageIndex - 1)
+                }
+                if (activeMessageIndex > activeMessagePlaylist.lastIndex) {
+                    activeMessageIndex = activeMessagePlaylist.lastIndex
+                    onSpeakMessage("Ese fue el último mensaje.")
+                    return
+                }
+                if (activeMessageIndex < 0) {
+                    activeMessageIndex = 0
+                    onSpeakMessage("Estás en el primer mensaje: ${activeMessagePlaylist[0]}")
+                    return
+                }
+                val item = activeMessagePlaylist[activeMessageIndex]
+                onSpeakMessage(item)
+            }
+
+            NavMode.CHAT_AUDIO -> {
+                val sender = activeChatSender
+                if (sender != null) {
+                    val contact = findContactByName(context, sender)
+                    if (contact != null) {
+                        activeChatAudioOffset = when {
+                            isRepeat -> activeChatAudioOffset
+                            isNext -> (activeChatAudioOffset + 1).coerceAtMost(10)
+                            else -> (activeChatAudioOffset - 1).coerceAtLeast(1)
+                        }
+                        JarvisAccessibilityService.requestAutoPlayVoiceNoteInWhatsApp(offsetFromBottom = activeChatAudioOffset)
+                        openWhatsAppChat(context, contact.second)
+                        return
+                    }
+                }
+                onSpeakMessage("No hay otro audio en este chat.")
+            }
+
+            NavMode.AUDIO_LIST -> {
+                if (activeAudioPlaylist.isEmpty()) {
+                    activeAudioPlaylist = getRecentOpusFilesFast(limit = 40)
+                    activeAudioIndex = 0
+                }
+                if (activeAudioPlaylist.isEmpty()) {
+                    onSpeakMessage("No hay audios para reproducir.")
+                    return
+                }
+                activeAudioIndex = when {
+                    isRepeat -> activeAudioIndex.coerceIn(0, activeAudioPlaylist.lastIndex)
+                    isNext -> activeAudioIndex + 1
+                    else -> activeAudioIndex - 1
+                }
+                if (activeAudioIndex > activeAudioPlaylist.lastIndex) {
+                    activeAudioIndex = activeAudioPlaylist.lastIndex
+                    onSpeakMessage("Ya no hay más audios en esta lista.")
+                    return
+                }
+                if (activeAudioIndex < 0) {
+                    activeAudioIndex = 0
+                }
+                playSingleAudioFile(activeAudioPlaylist[activeAudioIndex]) { ok, msg ->
+                    if (!ok) onSpeakMessage(msg)
+                }
+            }
+        }
+    }
+
+    private fun handleStepNavigation(
+        context: Context,
+        stepNext: Boolean,
+        stepPrevious: Boolean,
+        repeatCurrent: Boolean,
+        onFinished: (Boolean, String) -> Unit
+    ) {
+        stepActiveQueue(
+            context = context,
+            isNext = stepNext,
+            isRepeat = repeatCurrent,
+            onSpeakMessage = { msg -> onFinished(false, msg) }
+        )
+    }
+
+    private fun matchesDaySpec(timestamp: Long, dayFilter: String?): Boolean {
+        if (dayFilter.isNullOrBlank()) return true
+        val norm = normalizeText(dayFilter)
+        val calNow = Calendar.getInstance()
+        val calTarget = Calendar.getInstance().apply { timeInMillis = timestamp }
+
+        val todayYear = calNow.get(Calendar.YEAR)
+        val todayDay = calNow.get(Calendar.DAY_OF_YEAR)
+
+        val calYesterday = Calendar.getInstance().apply { add(Calendar.DAY_OF_YEAR, -1) }
+        val yestYear = calYesterday.get(Calendar.YEAR)
+        val yestDay = calYesterday.get(Calendar.DAY_OF_YEAR)
+
+        val isToday = calTarget.get(Calendar.YEAR) == todayYear && calTarget.get(Calendar.DAY_OF_YEAR) == todayDay
+        val isYesterday = calTarget.get(Calendar.YEAR) == yestYear && calTarget.get(Calendar.DAY_OF_YEAR) == yestDay
+
+        return when {
+            norm.contains("hoy") && norm.contains("ayer") -> isToday || isYesterday
+            norm.contains("antes de ayer") || norm.contains("anteayer") -> {
+                val calBefore = Calendar.getInstance().apply { add(Calendar.DAY_OF_YEAR, -2) }
+                calTarget.get(Calendar.YEAR) == calBefore.get(Calendar.YEAR) &&
+                    calTarget.get(Calendar.DAY_OF_YEAR) == calBefore.get(Calendar.DAY_OF_YEAR)
+            }
+            norm.contains("ayer") -> isYesterday
+            norm.contains("hoy") -> isToday
+            else -> true
+        }
+    }
+
+    private fun getRecentOpusFilesFast(limit: Int = 50): List<File> {
         val root = Environment.getExternalStorageDirectory()
         val voiceNotesBases = listOf(
             File(root, "Android/media/com.whatsapp/WhatsApp/Media/WhatsApp Voice Notes"),
@@ -190,7 +487,7 @@ object WhatsAppRepository {
             if (!base.exists() || !base.isDirectory) continue
             val subFolders = base.listFiles { f -> f.isDirectory }
                 ?.sortedByDescending { it.name }
-                ?.take(2)
+                ?.take(3)
                 .orEmpty()
 
             for (folder in subFolders) {
@@ -204,85 +501,10 @@ object WhatsAppRepository {
             if (!base.exists() || !base.isDirectory) continue
             base.listFiles { f ->
                 f.isFile && (f.name.endsWith(".opus", true) || f.name.endsWith(".mp3", true) || f.name.endsWith(".m4a", true))
-            }?.sortedByDescending { it.lastModified() }?.take(10)?.let { candidates.addAll(it) }
+            }?.sortedByDescending { it.lastModified() }?.take(15)?.let { candidates.addAll(it) }
         }
 
         return candidates.sortedByDescending { it.lastModified() }.take(limit)
-    }
-
-    /**
-     * Reproducción flexible de audios de WhatsApp:
-     * - Si el usuario especificó un contacto (ej. "Nico") y pidió abrir el chat o no tenemos el archivo local asociado,
-     *   abre directamente el chat de Nico en WhatsApp y el Servicio de Accesibilidad toca el botón Play del audio pedido
-     *   (1 = el último, 2 = el anterior/penúltimo, 3 = el antepenúltimo).
-     * - Si no especificó contacto (o tenemos el archivo en disco), reproduce instantáneamente desde memoria permitiendo
-     *   ir al "último", al "anterior / penúltimo", "repetir" o escuchar varios seguidos.
-     */
-    fun playWhatsAppVoiceNoteFlexible(
-        context: Context,
-        senderHint: String? = null,
-        whichOffset: Int = 1, // 1 = último, 2 = penúltimo/anterior, 3 = antepenúltimo
-        stepBackward: Boolean = false,
-        repeatCurrent: Boolean = false,
-        forceOpenChat: Boolean = false,
-        onFinished: (Boolean, String) -> Unit
-    ) {
-        stopAudioPlayback()
-
-        // 1. Si pidió explícitamente un contacto (ej. "reproducí el audio de Nico" o "abrí el chat de Nico y reproducí el audio")
-        if (!senderHint.isNullOrBlank()) {
-            val normSender = normalizeText(senderHint)
-
-            // Si no forzó abrir el chat y tenemos el archivo asociado de una notificación recién llegada (y pidió el último)
-            if (!forceOpenChat && whichOffset == 1 && !stepBackward) {
-                val matchedNotifAudio = messages.lastOrNull {
-                    (normalizeText(it.senderName).contains(normSender) || normSender.contains(normalizeText(it.senderName))) &&
-                        it.isVoiceNote &&
-                        it.associatedAudioFile?.exists() == true
-                }?.associatedAudioFile
-
-                if (matchedNotifAudio != null) {
-                    playSingleAudioFile(matchedNotifAudio, onFinished)
-                    return
-                }
-            }
-
-            // Buscamos al contacto en la agenda, abrimos su chat en WhatsApp y le damos Play al audio #whichOffset desde abajo
-            val contact = findContactByName(context, senderHint)
-            if (contact != null) {
-                JarvisAccessibilityService.requestAutoPlayVoiceNoteInWhatsApp(offsetFromBottom = whichOffset)
-                openWhatsAppChat(context, contact.second)
-                return
-            }
-
-            // Si dijo el nombre de alguien que nos mandó notificación pero no está agendado con ese nombre, abrimos la notificación
-            val notifMsg = messages.lastOrNull {
-                normalizeText(it.senderName).contains(normSender) || normSender.contains(normalizeText(it.senderName))
-            }
-            if (notifMsg?.replyPendingIntent != null) {
-                try {
-                    JarvisAccessibilityService.requestAutoPlayVoiceNoteInWhatsApp(offsetFromBottom = whichOffset)
-                    notifMsg.replyPendingIntent.send()
-                    return
-                } catch (_: Exception) {
-                }
-            }
-        }
-
-        // 2. Reproducción directa ultrarrápida desde los archivos .opus guardados en el teléfono
-        val recentFiles = getRecentOpusFilesFast(limit = 25)
-        if (recentFiles.isNotEmpty()) {
-            val targetIdx = when {
-                repeatCurrent -> currentAudioIndex.coerceIn(0, recentFiles.lastIndex)
-                stepBackward -> (currentAudioIndex + 1).coerceIn(0, recentFiles.lastIndex)
-                else -> (whichOffset - 1).coerceIn(0, recentFiles.lastIndex)
-            }
-            currentAudioIndex = targetIdx
-            playSingleAudioFile(recentFiles[targetIdx], onFinished)
-            return
-        }
-
-        onFinished(false, "No encontré audios de WhatsApp.")
     }
 
     private fun playSingleAudioFile(file: File, onFinished: (Boolean, String) -> Unit) {
@@ -297,7 +519,7 @@ object WhatsAppRepository {
                 setDataSource(file.absolutePath)
                 setOnCompletionListener {
                     stopAudioPlayback()
-                    onFinished(true, "Fin del audio.")
+                    onFinished(true, "")
                 }
                 setOnErrorListener { _, _, _ ->
                     stopAudioPlayback()
@@ -506,7 +728,7 @@ object WhatsAppRepository {
 
     fun findContactByName(context: Context, queryName: String): Pair<String, String>? {
         val normQuery = normalizeText(queryName)
-            .replace(Regex("^(el|la|los|las|a|de|del|con|chat de|chat con)\\s+"), "")
+            .replace(Regex("^(el|la|los|las|a|de|del|con|chat de|chat con|hoy|ayer)\\s+"), "")
             .trim()
         if (normQuery.isEmpty()) return null
 
@@ -550,9 +772,6 @@ object WhatsAppRepository {
         return bestMatch
     }
 
-    /**
-     * Busca si dentro de una frase libre hablada por el usuario se menciona algún contacto de la agenda.
-     */
     fun findMentionedContactInSentence(context: Context, sentence: String): String? {
         val normSentence = " " + normalizeText(sentence) + " "
         val projection = arrayOf(ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME)

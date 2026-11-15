@@ -24,10 +24,14 @@ import com.jarvis.accesible.services.JarvisAccessibilityService
 import com.jarvis.accesible.whatsapp.WhatsAppRepository
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
+import okhttp3.RequestBody.Companion.toRequestBody
+import org.json.JSONArray
 import org.json.JSONObject
 import java.text.SimpleDateFormat
+import java.util.Calendar
 import java.util.Date
 import java.util.Locale
 import java.util.concurrent.TimeUnit
@@ -36,16 +40,12 @@ import kotlin.math.roundToInt
 object SystemActionsController {
 
     private val httpClient = OkHttpClient.Builder()
-        .connectTimeout(8, TimeUnit.SECONDS)
-        .readTimeout(8, TimeUnit.SECONDS)
+        .connectTimeout(12, TimeUnit.SECONDS)
+        .readTimeout(18, TimeUnit.SECONDS)
         .build()
 
     private val mainHandler = Handler(Looper.getMainLooper())
 
-    /**
-     * Configura una alarma en el reloj nativo de Android con EXTRA_SKIP_UI = true
-     * para que nunca pida tocar la pantalla.
-     */
     fun setSilentAlarm(context: Context, hour: Int, minute: Int, label: String): String {
         val validHour = hour.coerceIn(0, 23)
         val validMinute = minute.coerceIn(0, 59)
@@ -65,10 +65,6 @@ object SystemActionsController {
         }
     }
 
-    /**
-     * Apaga o descarta cualquier alarma que esté sonando y detiene también cualquier música,
-     * video de YouTube o nota de voz que esté reproduciéndose.
-     */
     fun stopAnythingPlayingOrRinging(context: Context): String {
         WhatsAppRepository.stopAudioPlayback()
 
@@ -100,12 +96,11 @@ object SystemActionsController {
     }
 
     /**
-     * Busca en YouTube el primer ID de video real que coincida con el pedido del tío
-     * y lo reproduce directamente sin quedarse trabado en la lista de búsqueda.
+     * Busca en YouTube el primer video real que coincida con la canción pedida y lo reproduce directamente.
      */
     suspend fun playOnYouTubeDirectly(context: Context, searchQuery: String): String {
         val cleanQuery = searchQuery.trim()
-        if (cleanQuery.isEmpty()) return "Decime qué querés escuchar."
+        if (cleanQuery.isEmpty()) return "Decime qué canción querés escuchar."
 
         val videoId = withContext(Dispatchers.IO) {
             fetchFirstYouTubeVideoId(cleanQuery)
@@ -115,19 +110,19 @@ object SystemActionsController {
             JarvisAccessibilityService.requestAutoPlayInYouTube()
 
             if (videoId != null) {
-                val appIntent = Intent(Intent.ACTION_VIEW, Uri.parse("vnd.youtube:$videoId")).apply {
+                val watchUri = Uri.parse("https://www.youtube.com/watch?v=$videoId")
+                val appIntent = Intent(Intent.ACTION_VIEW, watchUri).apply {
+                    setPackage("com.google.android.youtube")
+                    putExtra("force_fullscreen", false)
                     addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
                 }
                 try {
                     context.startActivity(appIntent)
                 } catch (_: Exception) {
-                    val webIntent = Intent(
-                        Intent.ACTION_VIEW,
-                        Uri.parse("https://www.youtube.com/watch?v=$videoId")
-                    ).apply {
+                    val fallbackIntent = Intent(Intent.ACTION_VIEW, Uri.parse("vnd.youtube:$videoId")).apply {
                         addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
                     }
-                    context.startActivity(webIntent)
+                    context.startActivity(fallbackIntent)
                 }
                 "Poniendo $cleanQuery."
             } else {
@@ -137,7 +132,7 @@ object SystemActionsController {
                     addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
                 }
                 context.startActivity(searchIntent)
-                "Abriendo $cleanQuery en YouTube."
+                "Poniendo $cleanQuery."
             }
         } catch (e: Exception) {
             "No pude abrir YouTube."
@@ -148,28 +143,31 @@ object SystemActionsController {
         return try {
             val encoded = Uri.encode(query)
             val request = Request.Builder()
-                .url("https://www.youtube.com/results?search_query=$encoded")
+                .url("https://www.youtube.com/results?search_query=$encoded&hl=es")
                 .header(
                     "User-Agent",
-                    "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36"
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
                 )
+                .header("Cookie", "CONSENT=YES+cb.20210328-17-p0.es+FX+999")
                 .header("Accept-Language", "es-AR,es;q=0.9")
                 .build()
 
             httpClient.newCall(request).execute().use { response ->
                 if (!response.isSuccessful) return null
                 val html = response.body?.string() ?: return null
-                val regex = Regex("\"videoId\":\"([a-zA-Z0-9_-]{11})\"")
-                regex.find(html)?.groupValues?.getOrNull(1)
+                // Priorizamos videoRenderer para que sea siempre un video real reproducible y no un canal
+                val rendererRegex = Regex("\"videoRenderer\":\\{\"videoId\":\"([a-zA-Z0-9_-]{11})\"")
+                val firstRenderer = rendererRegex.find(html)?.groupValues?.getOrNull(1)
+                if (firstRenderer != null) return firstRenderer
+
+                val fallbackRegex = Regex("\"videoId\":\"([a-zA-Z0-9_-]{11})\"")
+                fallbackRegex.find(html)?.groupValues?.getOrNull(1)
             }
         } catch (_: Exception) {
             null
         }
     }
 
-    /**
-     * Realiza una llamada telefónica directa al contacto indicado y activa el altavoz manos libres.
-     */
     fun makePhoneCallOnSpeaker(context: Context, contactName: String): String {
         val contact = WhatsAppRepository.findContactByName(context, contactName)
             ?: return "No encontré a $contactName en tus contactos."
@@ -230,25 +228,16 @@ object SystemActionsController {
         }
     }
 
-    /**
-     * Solo responde la hora actual, cortito y directo.
-     */
     fun getCurrentTimeOnly(): String {
         val timeStr = SimpleDateFormat("HH:mm", Locale.getDefault()).format(Date())
         return "Son las $timeStr."
     }
 
-    /**
-     * Solo responde qué día y fecha es hoy.
-     */
     fun getCurrentDateOnly(): String {
         val dateStr = SimpleDateFormat("EEEE d 'de' MMMM", Locale("es", "AR")).format(Date())
         return "Hoy es $dateStr."
     }
 
-    /**
-     * Solo responde el porcentaje de batería (y si está cargando).
-     */
     fun getBatteryOnly(context: Context): String {
         val batteryIntent = context.registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
         val level = batteryIntent?.getIntExtra(BatteryManager.EXTRA_LEVEL, -1) ?: -1
@@ -267,9 +256,6 @@ object SystemActionsController {
         }
     }
 
-    /**
-     * Solo responde el estado de conexión si el usuario pregunta específicamente por Wi-Fi o internet.
-     */
     fun getConnectionOnly(context: Context): String {
         val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
         val netCaps = cm.getNetworkCapabilities(cm.activeNetwork)
@@ -282,10 +268,15 @@ object SystemActionsController {
     }
 
     /**
-     * Consulta la temperatura actual y el pronóstico del día usando la ubicación GPS del teléfono
-     * (con respaldo por ubicación de red si el GPS está apagado). No requiere ninguna API Key.
+     * Consulta el clima por GPS para:
+     * - Temperatura actual ("¿cuántos grados hace?")
+     * - Hoy ("¿cómo va a estar el clima hoy?")
+     * - Mañana / Pasado mañana ("¿cómo va a estar mañana?")
+     * - Un día puntual de la semana ("¿cómo va a estar el lunes?", "el sábado")
+     * - Los próximos X días ("¿cómo va a estar los próximos 3 días?", "esta semana")
      */
-    suspend fun getWeatherReport(context: Context, includeDailyForecast: Boolean): String = withContext(Dispatchers.IO) {
+    suspend fun getFlexibleWeatherReport(context: Context, rawUserQuery: String): String = withContext(Dispatchers.IO) {
+        val norm = WhatsAppRepository.normalizeText(rawUserQuery)
         val coords = getBestDeviceCoordinates(context)
         val lat = coords.first
         val lon = coords.second
@@ -293,8 +284,8 @@ object SystemActionsController {
         val url = "https://api.open-meteo.com/v1/forecast" +
             "?latitude=$lat&longitude=$lon" +
             "&current=temperature_2m,weather_code" +
-            "&daily=temperature_2m_max,temperature_2m_min,precipitation_probability_max" +
-            "&timezone=auto&forecast_days=1"
+            "&daily=weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max" +
+            "&timezone=auto&forecast_days=7"
 
         return@withContext try {
             val request = Request.Builder().url(url).build()
@@ -304,41 +295,116 @@ object SystemActionsController {
                 val json = JSONObject(body)
 
                 val current = json.optJSONObject("current")
-                val tempNow = current?.optDouble("temperature_2m", Double.NaN) ?: Double.NaN
-                val weatherCode = current?.optInt("weather_code", 0) ?: 0
-                val conditionText = describeWeatherCode(weatherCode)
+                val tempNow = current?.optDouble("temperature_2m", Double.NaN)?.takeIf { !it.isNaN() }?.roundToInt()
+                val codeNow = current?.optInt("weather_code", 0) ?: 0
+                val condNow = describeWeatherCode(codeNow)
 
-                val tempRounded = if (!tempNow.isNaN()) tempNow.roundToInt() else null
+                val daily = json.optJSONObject("daily") ?: return@withContext "Hacen ${tempNow ?: 20} grados."
+                val datesArr = daily.optJSONArray("time")
+                val codesArr = daily.optJSONArray("weather_code")
+                val maxArr = daily.optJSONArray("temperature_2m_max")
+                val minArr = daily.optJSONArray("temperature_2m_min")
+                val rainArr = daily.optJSONArray("precipitation_probability_max")
 
-                if (!includeDailyForecast && tempRounded != null) {
-                    return@withContext "Hacen $tempRounded grados, $conditionText."
+                // 1. ¿Pidió los próximos X días o toda la semana?
+                val multiDaysMatch = Regex("(?:proximos|siguientes)\\s+(\\d+)\\s+dias").find(norm)
+                if (multiDaysMatch != null || norm.contains("esta semana") || norm.contains("proximos dias")) {
+                    val count = (multiDaysMatch?.groupValues?.getOrNull(1)?.toIntOrNull() ?: 3).coerceIn(2, 6)
+                    val sb = StringBuilder()
+                    for (i in 1..count.coerceAtMost((maxArr?.length() ?: 1) - 1)) {
+                        val dayName = getDayNameForOffset(i)
+                        val maxT = maxArr?.optDouble(i, Double.NaN)?.roundToInt() ?: continue
+                        val minT = minArr?.optDouble(i, Double.NaN)?.roundToInt() ?: continue
+                        val rainP = rainArr?.optInt(i, 0) ?: 0
+                        val cond = describeWeatherCode(codesArr?.optInt(i, 0) ?: 0)
+                        val rainTxt = if (rainP >= 40) "con lluvia ($rainP%)" else cond
+                        sb.append("$dayName: máxima $maxT, mínima $minT, $rainTxt. ")
+                    }
+                    return@withContext sb.toString().trim()
                 }
 
-                val daily = json.optJSONObject("daily")
-                val maxArr = daily?.optJSONArray("temperature_2m_max")
-                val minArr = daily?.optJSONArray("temperature_2m_min")
-                val rainArr = daily?.optJSONArray("precipitation_probability_max")
+                // 2. ¿Pidió pasado mañana?
+                if (norm.contains("pasado manana")) {
+                    return@withContext formatSingleDayForecast("Pasado mañana", 2, codesArr, maxArr, minArr, rainArr)
+                }
 
-                val maxTemp = maxArr?.optDouble(0, Double.NaN)?.takeIf { !it.isNaN() }?.roundToInt()
-                val minTemp = minArr?.optDouble(0, Double.NaN)?.takeIf { !it.isNaN() }?.roundToInt()
-                val rainProb = rainArr?.optInt(0, 0) ?: 0
+                // 3. ¿Pidió mañana?
+                if (norm.contains("manana")) {
+                    return@withContext formatSingleDayForecast("Mañana", 1, codesArr, maxArr, minArr, rainArr)
+                }
+
+                // 4. ¿Pidió un día de la semana específico ("el lunes", "el martes", "el sábado", etc.)?
+                val targetDow = parseRequestedDayOfWeek(norm)
+                if (targetDow != null && datesArr != null) {
+                    val cal = Calendar.getInstance()
+                    for (i in 1 until datesArr.length()) {
+                        val checkCal = Calendar.getInstance().apply { add(Calendar.DAY_OF_YEAR, i) }
+                        if (checkCal.get(Calendar.DAY_OF_WEEK) == targetDow) {
+                            val label = getDayNameForOffset(i).replaceFirstChar { it.uppercase() }
+                            return@withContext formatSingleDayForecast(label, i, codesArr, maxArr, minArr, rainArr)
+                        }
+                    }
+                }
+
+                // 5. ¿Pidió solo cuántos grados hace ahora?
+                val wantsOnlyCurrentTemp = (norm.contains("cuantos grados") || norm.contains("que temperatura")) &&
+                    !norm.contains("hoy") && !norm.contains("maxima") && !norm.contains("clima")
+                if (wantsOnlyCurrentTemp && tempNow != null) {
+                    return@withContext "Hacen $tempNow grados, $condNow."
+                }
+
+                // 6. Clima de hoy completo
+                val maxToday = maxArr?.optDouble(0, Double.NaN)?.takeIf { !it.isNaN() }?.roundToInt()
+                val minToday = minArr?.optDouble(0, Double.NaN)?.takeIf { !it.isNaN() }?.roundToInt()
+                val rainToday = rainArr?.optInt(0, 0) ?: 0
 
                 val sb = StringBuilder()
-                if (tempRounded != null) {
-                    sb.append("Hacen $tempRounded grados, $conditionText. ")
+                if (tempNow != null) {
+                    sb.append("Hacen $tempNow grados, $condNow. ")
                 }
-                if (maxTemp != null && minTemp != null) {
-                    sb.append("Hoy máxima de $maxTemp y mínima de $minTemp. ")
+                if (maxToday != null && minToday != null) {
+                    sb.append("Hoy máxima $maxToday y mínima $minToday. ")
                 }
-                if (rainProb >= 40) {
-                    sb.append("Probabilidad de lluvia del $rainProb por ciento.")
-                } else {
-                    sb.append("Sin lluvias para hoy.")
-                }
+                sb.append(if (rainToday >= 40) "Probabilidad de lluvia $rainToday por ciento." else "Sin lluvias hoy.")
                 sb.toString().trim()
             }
         } catch (_: Exception) {
             "No hay internet para ver el clima."
+        }
+    }
+
+    private fun formatSingleDayForecast(
+        dayLabel: String,
+        index: Int,
+        codesArr: JSONArray?,
+        maxArr: JSONArray?,
+        minArr: JSONArray?,
+        rainArr: JSONArray?
+    ): String {
+        val maxT = maxArr?.optDouble(index, Double.NaN)?.takeIf { !it.isNaN() }?.roundToInt()
+            ?: return "No tengo el pronóstico de ese día."
+        val minT = minArr?.optDouble(index, Double.NaN)?.takeIf { !it.isNaN() }?.roundToInt() ?: 0
+        val rainP = rainArr?.optInt(index, 0) ?: 0
+        val cond = describeWeatherCode(codesArr?.optInt(index, 0) ?: 0)
+        val rainTxt = if (rainP >= 40) "probabilidad de lluvia del $rainP por ciento" else "sin lluvias"
+        return "$dayLabel: máxima $maxT, mínima $minT, $cond, $rainTxt."
+    }
+
+    private fun getDayNameForOffset(daysAhead: Int): String {
+        val cal = Calendar.getInstance().apply { add(Calendar.DAY_OF_YEAR, daysAhead) }
+        return SimpleDateFormat("EEEE", Locale("es", "AR")).format(cal.time)
+    }
+
+    private fun parseRequestedDayOfWeek(norm: String): Int? {
+        return when {
+            norm.contains("lunes") -> Calendar.MONDAY
+            norm.contains("martes") -> Calendar.TUESDAY
+            norm.contains("miercoles") -> Calendar.WEDNESDAY
+            norm.contains("jueves") -> Calendar.THURSDAY
+            norm.contains("viernes") -> Calendar.FRIDAY
+            norm.contains("sabado") -> Calendar.SATURDAY
+            norm.contains("domingo") -> Calendar.SUNDAY
+            else -> null
         }
     }
 
@@ -381,7 +447,6 @@ object SystemActionsController {
         } catch (_: Exception) {
         }
 
-        // Respaldo automático por IP si el GPS del teléfono estaba desactivado
         try {
             val req = Request.Builder().url("http://ip-api.com/json/?fields=lat,lon").build()
             httpClient.newCall(req).execute().use { resp ->
@@ -397,7 +462,6 @@ object SystemActionsController {
         } catch (_: Exception) {
         }
 
-        // Respaldo por defecto: Buenos Aires, Argentina
         return Pair(-34.6037, -58.3816)
     }
 
@@ -416,16 +480,92 @@ object SystemActionsController {
     }
 
     /**
-     * Buscador gratuito sin API Key (Wikipedia en Español + Google Noticias Argentina)
-     * para que las búsquedas en Google funcionen incluso si la clave de Gemini no está configurada.
+     * Inteligencia Artificial Gratuita Incorporada (Sin requerir API Key):
+     * Permite que el tío pida recetas paso a paso ("cómo hacer huevo revuelto"), consejos cotidianos,
+     * explicaciones o haga cualquier consulta general y reciba una respuesta inteligente en español argentino.
      */
+    suspend fun askFreeBuiltInAi(userQuestion: String): String = withContext(Dispatchers.IO) {
+        val norm = WhatsAppRepository.normalizeText(userQuestion)
+        val wantsStepByStep = norm.contains("paso a paso") ||
+            norm.contains("receta") ||
+            norm.contains("como hacer") ||
+            norm.contains("como hago") ||
+            norm.contains("como se hace") ||
+            norm.contains("como preparar") ||
+            norm.contains("como preparo") ||
+            norm.contains("explicame")
+
+        val sysInstruction = if (wantsStepByStep) {
+            "Sos un asistente de voz cálido en español rioplatense (Argentina) ayudando a una persona no vidente. " +
+                "Explicá el paso a paso de forma muy clara, ordenada (Paso 1, Paso 2, etc.) y fácil de seguir de oído. No uses asteriscos ni Markdown."
+        } else {
+            "Sos un asistente de voz en español rioplatense (Argentina) para una persona no vidente. " +
+                "Respondé de forma directa, natural y breve en 1 o 2 oraciones claras. No uses asteriscos ni Markdown."
+        }
+
+        // 1. Intentamos primero el endpoint OpenAI-compatible gratuito de Pollinations AI
+        try {
+            val payload = JSONObject().apply {
+                put("model", "openai")
+                put("messages", JSONArray()
+                    .put(JSONObject().apply {
+                        put("role", "system")
+                        put("content", sysInstruction)
+                    })
+                    .put(JSONObject().apply {
+                        put("role", "user")
+                        put("content", userQuestion)
+                    })
+                )
+            }
+            val req = Request.Builder()
+                .url("https://text.pollinations.ai/openai")
+                .post(payload.toString().toRequestBody("application/json; charset=utf-8".toMediaType()))
+                .build()
+
+            httpClient.newCall(req).execute().use { resp ->
+                if (resp.isSuccessful) {
+                    val body = resp.body?.string().orEmpty()
+                    val json = JSONObject(body)
+                    val content = json.optJSONArray("choices")
+                        ?.optJSONObject(0)
+                        ?.optJSONObject("message")
+                        ?.optString("content", "")
+                        ?.trim()
+                    if (!content.isNullOrBlank()) {
+                        return@withContext content
+                    }
+                }
+            }
+        } catch (_: Exception) {
+        }
+
+        // 2. Segundo endpoint GET directo de Pollinations AI
+        try {
+            val fullPrompt = "$sysInstruction Pregunta: $userQuestion"
+            val url = "https://text.pollinations.ai/${Uri.encode(fullPrompt)}?model=openai"
+            val req = Request.Builder().url(url).build()
+            httpClient.newCall(req).execute().use { resp ->
+                if (resp.isSuccessful) {
+                    val txt = resp.body?.string()?.trim().orEmpty()
+                    if (txt.isNotEmpty() && !txt.startsWith("<")) {
+                        return@withContext txt
+                    }
+                }
+            }
+        } catch (_: Exception) {
+        }
+
+        // 3. Respaldo final de noticias / Wikipedia si es una consulta de actualidad
+        return@withContext searchFreeWebWithoutApiKey(userQuestion)
+    }
+
     suspend fun searchFreeWebWithoutApiKey(rawQuery: String): String = withContext(Dispatchers.IO) {
         val clean = rawQuery
             .replace(Regex("(?i)^(buscame|busca|buscar|en google|googlea|que es|quien es|quien fue|como salio|cuando juega|decime)\\s+"), "")
             .trim()
         if (clean.isEmpty()) return@withContext "Decime qué querés buscar."
 
-        // 1. Si parece noticia actual o deporte ("cómo salió", "cuándo juega", "noticias", "dólar", etc.), buscamos en Google News Argentina
         val lower = rawQuery.lowercase()
         val isNewsOrSports = lower.contains("salio") ||
             lower.contains("salió") ||
@@ -444,15 +584,13 @@ object SystemActionsController {
             if (newsResult != null) return@withContext newsResult
         }
 
-        // 2. Buscamos resumen directo en Wikipedia en Español
         val wikiResult = fetchWikipediaSummaryEs(clean)
         if (wikiResult != null) return@withContext wikiResult
 
-        // 3. Si no estaba en Wikipedia, buscamos titular en Google Noticias Argentina
         val newsFallback = fetchGoogleNewsArgentinaHeadline(clean)
         if (newsFallback != null) return@withContext newsFallback
 
-        return@withContext "No encontré resultados para $clean."
+        return@withContext "No te entendí, ¿repetís?"
     }
 
     private fun fetchWikipediaSummaryEs(query: String): String? {
@@ -482,9 +620,7 @@ object SystemActionsController {
                 val json = JSONObject(resp.body?.string() ?: return null)
                 val extract = json.optString("extract", "").trim()
                 if (extract.isEmpty()) return null
-                // Tomamos las primeras 2 oraciones para que sea corto y claro
-                val sentences = extract.split(Regex("(?<=\\.)\\s+")).take(2).joinToString(" ")
-                sentences
+                extract.split(Regex("(?<=\\.)\\s+")).take(2).joinToString(" ")
             }
         } catch (_: Exception) {
             null

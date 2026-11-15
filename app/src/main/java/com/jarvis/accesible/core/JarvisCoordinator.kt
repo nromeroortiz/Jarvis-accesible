@@ -21,7 +21,6 @@ import kotlinx.coroutines.launch
 
 /**
  * Coordinador principal que une la voz, el botón físico, la IA y las acciones sobre WhatsApp/Android.
- * Todas las respuestas fueron optimizadas para ser cortas, directas y sin rodeos.
  */
 class JarvisCoordinator private constructor(private val context: Context) {
 
@@ -36,7 +35,6 @@ class JarvisCoordinator private constructor(private val context: Context) {
     var isProcessingUiState by mutableStateOf(false)
         private set
 
-    // Si hay un mensaje de texto de WhatsApp esperando que el tío diga "Sí" o "No"
     private var pendingWhatsAppConfirmation: Pair<String, String>? = null
 
     val speechInput = SpeechInputManager(
@@ -133,34 +131,52 @@ class JarvisCoordinator private constructor(private val context: Context) {
                 }
 
                 is AgentDecision.CheckWeather -> {
-                    val weatherMsg = SystemActionsController.getWeatherReport(context, decision.includeForecast)
+                    val weatherMsg = SystemActionsController.getFlexibleWeatherReport(context, decision.rawQuery)
                     speaker.speak(weatherMsg)
                 }
 
                 is AgentDecision.CheckUnreadWhatsApp -> {
-                    val summary = WhatsAppRepository.getUnreadSummary()
+                    val summary = WhatsAppRepository.getUnreadSummary(context)
                     speaker.speak(summary)
                 }
 
-                is AgentDecision.ReadWhatsAppFromSender -> {
-                    val report = WhatsAppRepository.getMessagesFromSender(context, decision.senderName)
+                is AgentDecision.ReadWhatsAppMessagesFiltered -> {
+                    val report = WhatsAppRepository.readMessagesByFilter(
+                        context = context,
+                        senderQuery = decision.senderName,
+                        dayFilter = decision.dayFilter,
+                        onAsyncScreenRead = { screenText ->
+                            speaker.speak(screenText)
+                        }
+                    )
                     speaker.speak(report)
                 }
 
                 is AgentDecision.PlayWhatsAppVoiceNote -> {
-                    // Reproducimos de inmediato sin discurso previo largo para que no demore
                     WhatsAppRepository.playWhatsAppVoiceNoteFlexible(
                         context = context,
                         senderHint = decision.senderName,
                         whichOffset = decision.whichOffset,
-                        stepBackward = decision.stepBackward,
-                        repeatCurrent = decision.repeatCurrent,
+                        dayFilter = decision.dayFilter,
                         forceOpenChat = decision.forceOpenChat
                     ) { ok, finishMsg ->
-                        if (!ok) {
+                        if (!ok && finishMsg.isNotBlank()) {
                             speaker.speak(finishMsg)
                         }
                     }
+                }
+
+                is AgentDecision.NavigateQueue -> {
+                    WhatsAppRepository.stepActiveQueue(
+                        context = context,
+                        isNext = decision.isNext,
+                        isRepeat = decision.isRepeat,
+                        onSpeakMessage = { msg ->
+                            if (msg.isNotBlank()) {
+                                speaker.speak(msg)
+                            }
+                        }
+                    )
                 }
 
                 is AgentDecision.ProposeWhatsAppTextMessage -> {
