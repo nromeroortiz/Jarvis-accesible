@@ -45,12 +45,14 @@ data class UnifiedChatEntry(
     val spokenText: String,
     val localAudioFile: File? = null,
     val screenAudioOrderInDay: Int = -1,
-    val audioDurationMs: Long = 12_000L,
+    val screenTopY: Int = -1,
+    val audioDurationMs: Long = 6_000L,
     val dayFilter: String = "hoy"
 )
 
 object WhatsAppRepository {
 
+    private val ioExecutor = java.util.concurrent.Executors.newSingleThreadExecutor()
     private val messages = CopyOnWriteArrayList<WhatsAppIncomingMessage>()
     private var isHistoryLoaded = false
     private var mediaPlayer: MediaPlayer? = null
@@ -60,6 +62,14 @@ object WhatsAppRepository {
     private var activeRecordingContactPhone: String? = null
     private var activeRecordingOnCompleted: ((String) -> Unit)? = null
     private val mainHandler = Handler(Looper.getMainLooper())
+
+    fun preloadInBackground(context: Context) {
+        val appCtx = context.applicationContext
+        ioExecutor.execute {
+            ensureHistoryLoaded(appCtx)
+            ensureContactsCached(appCtx)
+        }
+    }
 
     private var activeQueue: List<UnifiedChatEntry> = emptyList()
     private val alreadyReadTextsInCurrentDay = mutableSetOf<String>()
@@ -140,22 +150,25 @@ object WhatsAppRepository {
     }
 
     private fun saveHistoryToDisk(context: Context) {
-        try {
-            val arr = JSONArray()
-            val recent = messages.takeLast(200)
-            for (m in recent) {
-                arr.put(JSONObject().apply {
-                    put("id", m.id)
-                    put("senderName", m.senderName)
-                    put("text", m.text)
-                    put("isVoiceNote", m.isVoiceNote)
-                    put("timestamp", m.timestamp)
-                    put("associatedAudioPath", m.associatedAudioPath ?: "")
-                    put("isReadByUncle", m.isReadByUncle)
-                })
+        val appCtx = context.applicationContext
+        val recent = messages.takeLast(200)
+        ioExecutor.execute {
+            try {
+                val arr = JSONArray()
+                for (m in recent) {
+                    arr.put(JSONObject().apply {
+                        put("id", m.id)
+                        put("senderName", m.senderName)
+                        put("text", m.text)
+                        put("isVoiceNote", m.isVoiceNote)
+                        put("timestamp", m.timestamp)
+                        put("associatedAudioPath", m.associatedAudioPath ?: "")
+                        put("isReadByUncle", m.isReadByUncle)
+                    })
+                }
+                File(appCtx.filesDir, "whatsapp_history.json").writeText(arr.toString())
+            } catch (_: Exception) {
             }
-            File(context.filesDir, "whatsapp_history.json").writeText(arr.toString())
-        } catch (_: Exception) {
         }
     }
 
@@ -192,7 +205,6 @@ object WhatsAppRepository {
         replyIntent: PendingIntent?,
         remoteInputs: Array<RemoteInput>?
     ) {
-        ensureHistoryLoaded(context)
         val cleanSender = sender.trim()
         val cleanText = text.trim()
 
@@ -204,33 +216,36 @@ object WhatsAppRepository {
 
         lastOpenedContactName = cleanSender
 
-        val existingIndex = messages.indexOfFirst {
-            it.senderName.equals(cleanSender, ignoreCase = true) &&
-                it.text == cleanText &&
-                (System.currentTimeMillis() - it.timestamp) < 25_000L
-        }
-        if (existingIndex >= 0) return
+        ioExecutor.execute {
+            ensureHistoryLoaded(context.applicationContext)
+            val existingIndex = messages.indexOfFirst {
+                it.senderName.equals(cleanSender, ignoreCase = true) &&
+                    it.text == cleanText &&
+                    (System.currentTimeMillis() - it.timestamp) < 25_000L
+            }
+            if (existingIndex >= 0) return@execute
 
-        val latestAudioPath = if (isVoiceNote) {
-            findLatestWhatsAppVoiceNoteFile(maxAgeMillis = 180_000L)?.absolutePath
-        } else {
-            null
-        }
+            val latestAudioPath = if (isVoiceNote) {
+                findLatestWhatsAppVoiceNoteFile(maxAgeMillis = 180_000L)?.absolutePath
+            } else {
+                null
+            }
 
-        messages.add(
-            WhatsAppIncomingMessage(
-                id = id,
-                senderName = cleanSender,
-                text = cleanText,
-                isVoiceNote = isVoiceNote,
-                timestamp = System.currentTimeMillis(),
-                replyPendingIntent = replyIntent,
-                remoteInputs = remoteInputs,
-                associatedAudioPath = latestAudioPath,
-                isReadByUncle = false
+            messages.add(
+                WhatsAppIncomingMessage(
+                    id = id,
+                    senderName = cleanSender,
+                    text = cleanText,
+                    isVoiceNote = isVoiceNote,
+                    timestamp = System.currentTimeMillis(),
+                    replyPendingIntent = replyIntent,
+                    remoteInputs = remoteInputs,
+                    associatedAudioPath = latestAudioPath,
+                    isReadByUncle = false
+                )
             )
-        )
-        saveHistoryToDisk(context)
+            saveHistoryToDisk(context)
+        }
     }
 
     /**
@@ -473,6 +488,7 @@ object WhatsAppRepository {
                 UnifiedChatEntry(
                     isAudio = false,
                     spokenText = item.text,
+                    screenTopY = item.topY,
                     audioDurationMs = 0L,
                     dayFilter = dayFilter
                 )
@@ -481,6 +497,7 @@ object WhatsAppRepository {
                     isAudio = true,
                     spokenText = "",
                     screenAudioOrderInDay = item.audioOrderInDay,
+                    screenTopY = item.topY,
                     audioDurationMs = item.audioDurationMs,
                     dayFilter = dayFilter
                 )
@@ -503,16 +520,19 @@ object WhatsAppRepository {
 
         val currentGen = ++autoAdvanceGeneration
         val entry = activeQueue[activeQueueIndex]
+        val prevWasAudio = activeQueueIndex > 0 && activeQueue[activeQueueIndex - 1].isAudio
 
         if (!entry.isAudio) {
-            JarvisAccessibilityService.instance?.pauseAnyPlayingVoiceNoteOnScreen()
+            if (prevWasAudio) {
+                JarvisAccessibilityService.instance?.pauseAnyPlayingVoiceNoteOnScreen()
+            }
 
             speakCallback(entry.spokenText) {
                 mainHandler.postDelayed({
                     if (currentGen == autoAdvanceGeneration) {
                         advanceOrFinishDayQueue(context, speakCallback)
                     }
-                }, 400L)
+                }, 220L)
             }
         } else if (entry.localAudioFile != null && entry.localAudioFile.exists()) {
             playSingleAudioFile(entry.localAudioFile) { ok, errMsg ->
@@ -523,28 +543,43 @@ object WhatsAppRepository {
                 }
             }
         } else if (entry.screenAudioOrderInDay >= 0) {
-            val clicked = JarvisAccessibilityService.instance?.clickAudioInCurrentScreenByDayOrder(
-                entry.dayFilter,
-                entry.screenAudioOrderInDay
-            ) ?: false
+            val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
+            val startDelayMs = if (activeQueueIndex > 0 && !prevWasAudio) 160L else 0L
 
-            if (!clicked) {
+            mainHandler.postDelayed({
+                if (currentGen != autoAdvanceGeneration) return@postDelayed
+
+                val clicked = JarvisAccessibilityService.instance?.clickAudioInCurrentScreenByDayOrder(
+                    entry.dayFilter,
+                    entry.screenAudioOrderInDay,
+                    entry.screenTopY
+                ) ?: false
+
+                // Si en un celular gama baja (A01/A21s) el primer toque no arrancó el audio a los 380ms, reintentamos una vez
                 mainHandler.postDelayed({
-                    if (currentGen == autoAdvanceGeneration) {
+                    if (currentGen != autoAdvanceGeneration) return@postDelayed
+                    val musicActive = try {
+                        audioManager.isMusicActive
+                    } catch (_: Exception) {
+                        false
+                    }
+                    val pauseVisible = JarvisAccessibilityService.instance?.isAnyVoiceNoteCurrentlyPlayingOnScreen() ?: false
+                    if (!clicked || (!musicActive && !pauseVisible)) {
                         JarvisAccessibilityService.instance?.clickAudioInCurrentScreenByDayOrder(
                             entry.dayFilter,
-                            entry.screenAudioOrderInDay
+                            entry.screenAudioOrderInDay,
+                            entry.screenTopY
                         )
                     }
-                }, 600L)
-            }
+                }, 380L)
 
-            scheduleScreenAudioCompletionMonitor(
-                context = context,
-                expectedGen = currentGen,
-                expectedDurationMs = entry.audioDurationMs,
-                speakCallback = speakCallback
-            )
+                scheduleScreenAudioCompletionMonitor(
+                    context = context,
+                    expectedGen = currentGen,
+                    expectedDurationMs = entry.audioDurationMs,
+                    speakCallback = speakCallback
+                )
+            }, startDelayMs)
         }
     }
 
@@ -593,7 +628,7 @@ object WhatsAppRepository {
     ) {
         val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
         val startWait = System.currentTimeMillis()
-        val minWaitMs = expectedDurationMs.coerceAtLeast(6_500L)
+        var hasSeenAudioPlaying = false
         var consecutiveQuietChecks = 0
 
         val checkRunnable = object : Runnable {
@@ -601,38 +636,36 @@ object WhatsAppRepository {
                 if (expectedGen != autoAdvanceGeneration) return
                 val elapsed = System.currentTimeMillis() - startWait
 
-                if (elapsed < minWaitMs) {
-                    mainHandler.postDelayed(this, 1000L)
-                    return
-                }
-
-                val hasPauseBtn = JarvisAccessibilityService.instance?.isAnyVoiceNoteCurrentlyPlayingOnScreen() ?: false
                 val musicActive = try {
                     audioManager.isMusicActive
                 } catch (_: Exception) {
                     false
                 }
-
-                val nextEntryIsText = (activeQueueIndex + 1 <= activeQueue.lastIndex) && !activeQueue[activeQueueIndex + 1].isAudio
-                if (nextEntryIsText && elapsed >= expectedDurationMs + 600L) {
-                    advanceOrFinishDayQueue(context, speakCallback)
-                    return
-                }
-
-                if (!hasPauseBtn && !musicActive) {
-                    consecutiveQuietChecks++
+                val hasPauseBtn = if (musicActive) {
+                    true
                 } else {
-                    consecutiveQuietChecks = 0
+                    JarvisAccessibilityService.instance?.isAnyVoiceNoteCurrentlyPlayingOnScreen() ?: false
                 }
 
-                if (consecutiveQuietChecks >= 2 || elapsed >= expectedDurationMs + 2500L) {
+                if (musicActive || hasPauseBtn) {
+                    hasSeenAudioPlaying = true
+                    consecutiveQuietChecks = 0
+                } else if (hasSeenAudioPlaying || elapsed >= 2_100L) {
+                    consecutiveQuietChecks++
+                }
+
+                val maxWaitForThisAudio = (expectedDurationMs + 1_800L).coerceAtLeast(3_800L)
+                if ((hasSeenAudioPlaying && consecutiveQuietChecks >= 2) ||
+                    (!hasSeenAudioPlaying && elapsed >= 2_800L && consecutiveQuietChecks >= 2) ||
+                    elapsed >= maxWaitForThisAudio
+                ) {
                     advanceOrFinishDayQueue(context, speakCallback)
                 } else if (elapsed < 240_000L) {
-                    mainHandler.postDelayed(this, 1000L)
+                    mainHandler.postDelayed(this, 350L)
                 }
             }
         }
-        mainHandler.postDelayed(checkRunnable, 1500L)
+        mainHandler.postDelayed(checkRunnable, 800L)
     }
 
     fun stepActiveQueue(
@@ -1157,21 +1190,38 @@ object WhatsAppRepository {
         mediaRecorder = null
     }
 
-    fun findContactByName(context: Context, queryName: String): Pair<String, String>? {
-        val normQuery = normalizeText(queryName)
-            .replace(Regex("^(el|la|los|las|a|de|del|con|chat de|chat con|hoy|ayer|persona)\\s+"), "")
-            .trim()
-        if (normQuery.isEmpty()) return null
+    private data class CachedContact(
+        val name: String,
+        val number: String,
+        val normName: String,
+        val phoneticName: String,
+        val phoneticWords: List<String>
+    )
 
-        val phoneticQuery = toSpanishPhonetic(normQuery)
-        var exactPhoneticMatch: Pair<String, String>? = null
-        var partialMatch: Pair<String, String>? = null
+    @Volatile
+    private var cachedContacts: List<CachedContact> = emptyList()
 
+    @Volatile
+    private var lastContactsLoadTime: Long = 0L
+
+    private val CONTACT_PREFIX_CLEAN_REGEX = Regex("^(el|la|los|las|a|de|del|con|chat de|chat con|hoy|ayer|persona)\\s+")
+    private val REPEATED_LETTERS_REGEX = Regex("([a-z])\\1+")
+    private val NON_ALPHANUM_REGEX = Regex("[^a-z0-9 ]")
+    private val MULTI_SPACE_REGEX = Regex("\\s+")
+    private val DIACRITICS_REGEX = Regex("\\p{InCombiningDiacriticalMarks}+")
+
+    private fun ensureContactsCached(context: Context): List<CachedContact> {
+        val now = System.currentTimeMillis()
+        val current = cachedContacts
+        if (current.isNotEmpty() && (now - lastContactsLoadTime) < 300_000L) {
+            return current
+        }
+
+        val loaded = mutableListOf<CachedContact>()
         val projection = arrayOf(
             ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME,
             ContactsContract.CommonDataKinds.Phone.NUMBER
         )
-
         var cursor: Cursor? = null
         try {
             cursor = context.contentResolver.query(
@@ -1184,26 +1234,51 @@ object WhatsAppRepository {
             if (cursor != null && cursor.moveToFirst()) {
                 val nameIdx = cursor.getColumnIndex(ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME)
                 val numIdx = cursor.getColumnIndex(ContactsContract.CommonDataKinds.Phone.NUMBER)
+                val seenNames = HashSet<String>()
                 do {
-                    val name = cursor.getString(nameIdx) ?: continue
-                    val number = cursor.getString(numIdx) ?: continue
+                    val name = cursor.getString(nameIdx)?.trim() ?: continue
+                    val number = cursor.getString(numIdx)?.trim() ?: continue
+                    if (name.isEmpty() || number.isEmpty()) continue
                     val normName = normalizeText(name)
+                    if (!seenNames.add(normName)) continue
                     val phoneticName = toSpanishPhonetic(normName)
-
-                    if (normName == normQuery) {
-                        return Pair(name, number)
-                    }
-                    if (phoneticName == phoneticQuery && exactPhoneticMatch == null) {
-                        exactPhoneticMatch = Pair(name, number)
-                    }
-                    if (isPhoneticMatch(name, normQuery) && partialMatch == null) {
-                        partialMatch = Pair(name, number)
-                    }
+                    val words = phoneticName.split(" ").filter { it.length >= 2 }
+                    loaded.add(CachedContact(name, number, normName, phoneticName, words))
                 } while (cursor.moveToNext())
             }
         } catch (_: Exception) {
         } finally {
             cursor?.close()
+        }
+
+        if (loaded.isNotEmpty()) {
+            cachedContacts = loaded
+            lastContactsLoadTime = now
+        }
+        return cachedContacts
+    }
+
+    fun findContactByName(context: Context, queryName: String): Pair<String, String>? {
+        val normQuery = normalizeText(queryName)
+            .replace(CONTACT_PREFIX_CLEAN_REGEX, "")
+            .trim()
+        if (normQuery.isEmpty()) return null
+
+        val phoneticQuery = toSpanishPhonetic(normQuery)
+        val contacts = ensureContactsCached(context)
+        var exactPhoneticMatch: Pair<String, String>? = null
+        var partialMatch: Pair<String, String>? = null
+
+        for (c in contacts) {
+            if (c.normName == normQuery) {
+                return Pair(c.name, c.number)
+            }
+            if (c.phoneticName == phoneticQuery && exactPhoneticMatch == null) {
+                exactPhoneticMatch = Pair(c.name, c.number)
+            }
+            if (partialMatch == null && isPhoneticCachedMatch(c, phoneticQuery)) {
+                partialMatch = Pair(c.name, c.number)
+            }
         }
         return exactPhoneticMatch ?: partialMatch
     }
@@ -1212,39 +1287,36 @@ object WhatsAppRepository {
         val phoneticSentenceWords = toSpanishPhonetic(sentence).split(" ").filter { it.length >= 3 }
         if (phoneticSentenceWords.isEmpty()) return null
 
-        val projection = arrayOf(ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME)
-        var cursor: Cursor? = null
+        val contacts = ensureContactsCached(context)
         var bestMatch: String? = null
         var bestWordCount = 0
-        try {
-            cursor = context.contentResolver.query(
-                ContactsContract.CommonDataKinds.Phone.CONTENT_URI,
-                projection,
-                null,
-                null,
-                null
-            )
-            if (cursor != null && cursor.moveToFirst()) {
-                val nameIdx = cursor.getColumnIndex(ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME)
-                do {
-                    val name = cursor.getString(nameIdx)?.trim() ?: continue
-                    val contactWords = toSpanishPhonetic(name).split(" ").filter { it.length >= 2 }
-                    if (contactWords.isEmpty()) continue
 
-                    val allWordsPresent = contactWords.all { cw ->
-                        phoneticSentenceWords.any { sw -> sw == cw || (cw.length >= 4 && editDistance(sw, cw) <= 1) }
-                    }
-                    if (allWordsPresent && contactWords.size >= bestWordCount) {
-                        bestWordCount = contactWords.size
-                        bestMatch = name
-                    }
-                } while (cursor.moveToNext())
+        for (c in contacts) {
+            if (c.phoneticWords.isEmpty()) continue
+            val allWordsPresent = c.phoneticWords.all { cw ->
+                phoneticSentenceWords.any { sw -> sw == cw || (cw.length >= 4 && editDistance(sw, cw) <= 1) }
             }
-        } catch (_: Exception) {
-        } finally {
-            cursor?.close()
+            if (allWordsPresent && c.phoneticWords.size >= bestWordCount) {
+                bestWordCount = c.phoneticWords.size
+                bestMatch = c.name
+            }
         }
         return bestMatch
+    }
+
+    private fun isPhoneticCachedMatch(contact: CachedContact, pQuery: String): Boolean {
+        val pCand = contact.phoneticName
+        if (pCand.isEmpty() || pQuery.isEmpty()) return false
+        if (pCand == pQuery || pCand.contains(pQuery) || pQuery.contains(pCand)) return true
+
+        val queryWords = pQuery.split(" ").filter { it.length >= 2 }
+        if (queryWords.isNotEmpty() && queryWords.all { qw ->
+                contact.phoneticWords.any { cw -> cw == qw || cw.contains(qw) || qw.contains(cw) || (qw.length >= 4 && editDistance(cw, qw) <= 1) }
+            }
+        ) {
+            return true
+        }
+        return false
     }
 
     fun isPhoneticMatch(candidateName: String, queryName: String): Boolean {
@@ -1273,9 +1345,9 @@ object WhatsAppRepository {
             .replace("ce", "se")
             .replace("ci", "si")
             .replace("h", "")
-            .replace(Regex("([a-z])\\1+"), "$1")
-            .replace(Regex("[^a-z0-9 ]"), " ")
-            .replace(Regex("\\s+"), " ")
+            .replace(REPEATED_LETTERS_REGEX, "$1")
+            .replace(NON_ALPHANUM_REGEX, " ")
+            .replace(MULTI_SPACE_REGEX, " ")
             .trim()
     }
 
@@ -1306,6 +1378,6 @@ object WhatsAppRepository {
 
     fun normalizeText(input: String): String {
         val temp = Normalizer.normalize(input.lowercase(Locale.getDefault()).trim(), Normalizer.Form.NFD)
-        return Regex("\\p{InCombiningDiacriticalMarks}+").replace(temp, "")
+        return DIACRITICS_REGEX.replace(temp, "")
     }
 }

@@ -32,7 +32,7 @@ data class ScreenChatItem(
     val text: String,
     val topY: Int,
     val audioOrderInDay: Int,
-    val audioDurationMs: Long = 12_000L
+    val audioDurationMs: Long = 6_000L
 )
 
 class JarvisAccessibilityService : AccessibilityService() {
@@ -43,6 +43,24 @@ class JarvisAccessibilityService : AccessibilityService() {
     private var scrollAttemptsLeft = 0
     private var searchAlternateTried = false
     private var silenceMonitorAudioRecord: AudioRecord? = null
+
+    private fun screenHeightPx(): Int =
+        resources.displayMetrics.heightPixels.coerceAtLeast(1280)
+
+    private fun screenWidthPx(): Int =
+        resources.displayMetrics.widthPixels.coerceAtLeast(720)
+
+    private fun densityScale(): Float =
+        resources.displayMetrics.density.coerceAtLeast(1.5f)
+
+    private fun chatContentMinTopPx(): Int =
+        (screenHeightPx() * 0.07f).toInt().coerceIn(90, 240)
+
+    private fun chatContentMaxBottomPx(): Int =
+        (screenHeightPx() * 0.93f).toInt().coerceAtLeast(1100)
+
+    private fun rowDedupBucketPx(): Int =
+        (12f * densityScale()).toInt().coerceIn(14, 34)
 
     @Volatile
     private var currentForegroundPackage: String = ""
@@ -102,9 +120,11 @@ class JarvisAccessibilityService : AccessibilityService() {
         val now = System.currentTimeMillis()
 
         if (pkg.startsWith("com.whatsapp")) {
-            val rootForOutdated = rootInActiveWindow
-            if (rootForOutdated != null && now > lastOutdatedWhatsAppTriggerTime + 45_000L) {
-                if (detectWhatsAppOutdatedScreen(rootForOutdated)) {
+            if (event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED &&
+                now > lastOutdatedWhatsAppTriggerTime + 180_000L
+            ) {
+                val rootForOutdated = rootInActiveWindow
+                if (rootForOutdated != null && detectWhatsAppOutdatedScreen(rootForOutdated)) {
                     lastOutdatedWhatsAppTriggerTime = now
                     val coordinator = JarvisCoordinator.getInstance(applicationContext)
                     coordinator.speaker.speak("WhatsApp pide actualizarse. Abriendo Play Store para actualizarlo solo.") {
@@ -119,6 +139,16 @@ class JarvisAccessibilityService : AccessibilityService() {
                     return
                 }
             }
+
+            val hasActiveWhatsAppTask = now < autoClickSendUntilTimestamp ||
+                (now < autoSearchContactUntilTimestamp && pendingSearchContactName != null) ||
+                now < autoStartNativeMicUntilTimestamp ||
+                now < autoPlayLatestSingleAudioUntilTimestamp ||
+                now < autoInspectDayChatUntilTimestamp
+
+            // Salida ultrarrápida para celulares de bajos recursos (A01 / A21s):
+            // si no hay ninguna tarea activa de Wally en curso, no pedimos rootInActiveWindow ni recorremos nodos.
+            if (!hasActiveWhatsAppTask) return
 
             // A) Clic automático en "Aceptar / OK" y luego en "Enviar" al mandar mensaje o audio
             if (now < autoClickSendUntilTimestamp) {
@@ -137,7 +167,7 @@ class JarvisAccessibilityService : AccessibilityService() {
                     pendingSendRecipientName = null
                 } else if (!pendingSendRecipientName.isNullOrBlank()) {
                     val recipient = pendingSendRecipientName!!
-                    if (clickNodeMatchingPhonetically(root, recipient, minTop = 210)) {
+                    if (clickNodeMatchingPhonetically(root, recipient, minTop = chatContentMinTopPx())) {
                         pendingSendRecipientName = null
                     }
                 }
@@ -159,42 +189,46 @@ class JarvisAccessibilityService : AccessibilityService() {
                     autoStartNativeMicUntilTimestamp = 0L
                     val cb = onNativeMicReadyCallback
                     onNativeMicReadyCallback = null
-                    // Esperamos 450ms para que termine la animación de apertura del chat antes de apoyar el gesto en el micrófono
+                    // Esperamos 400ms para que termine la animación de apertura del chat antes de apoyar el gesto en el micrófono
                     mainHandler.postDelayed({
                         val freshRoot = rootInActiveWindow
                         val freshBounds = if (freshRoot != null) findWhatsAppMicButtonBounds(freshRoot) ?: micBounds else micBounds
                         cb?.invoke(freshBounds)
-                    }, 450L)
+                    }, 400L)
                 }
                 return
             }
 
             // D) Reproducir ÚNICAMENTE el último audio del chat abierto (para "¿Tengo mensajes?" / "Reproducilo")
             if (now < autoPlayLatestSingleAudioUntilTimestamp) {
-                pendingChatInspectRunnable?.let { mainHandler.removeCallbacks(it) }
-                val runnable = Runnable {
-                    val freshRoot = rootInActiveWindow ?: return@Runnable
-                    if (clickLatestAudioInCurrentChatScreen(freshRoot)) {
-                        autoPlayLatestSingleAudioUntilTimestamp = 0L
-                        val cb = onLatestSingleAudioClickedCallback
-                        onLatestSingleAudioClickedCallback = null
-                        cb?.invoke(true)
+                if (pendingChatInspectRunnable == null) {
+                    val runnable = Runnable {
+                        pendingChatInspectRunnable = null
+                        val freshRoot = rootInActiveWindow ?: return@Runnable
+                        if (clickLatestAudioInCurrentChatScreen(freshRoot)) {
+                            autoPlayLatestSingleAudioUntilTimestamp = 0L
+                            val cb = onLatestSingleAudioClickedCallback
+                            onLatestSingleAudioClickedCallback = null
+                            cb?.invoke(true)
+                        }
                     }
+                    pendingChatInspectRunnable = runnable
+                    mainHandler.postDelayed(runnable, 360L)
                 }
-                pendingChatInspectRunnable = runnable
-                mainHandler.postDelayed(runnable, 750L)
                 return
             }
 
             // E) Inspeccionar el chat abierto para el día pedido ("hoy", "ayer", "viernes", etc.) subiendo hasta el principio del día
             if (now < autoInspectDayChatUntilTimestamp) {
-                pendingChatInspectRunnable?.let { mainHandler.removeCallbacks(it) }
-                val runnable = Runnable {
-                    val freshRoot = rootInActiveWindow ?: return@Runnable
-                    processOpenChatForRequestedDay(freshRoot)
+                if (pendingChatInspectRunnable == null) {
+                    val runnable = Runnable {
+                        pendingChatInspectRunnable = null
+                        val freshRoot = rootInActiveWindow ?: return@Runnable
+                        processOpenChatForRequestedDay(freshRoot)
+                    }
+                    pendingChatInspectRunnable = runnable
+                    mainHandler.postDelayed(runnable, 360L)
                 }
-                pendingChatInspectRunnable = runnable
-                mainHandler.postDelayed(runnable, 750L)
                 return
             }
         }
@@ -517,6 +551,7 @@ class JarvisAccessibilityService : AccessibilityService() {
     }
 
     private fun findWhatsAppMicButtonBounds(root: AccessibilityNodeInfo): Rect? {
+        val minTopForMic = (screenHeightPx() * 0.42f).toInt()
         val micIds = listOf(
             "com.whatsapp:id/voice_note_btn",
             "com.whatsapp.w4b:id/voice_note_btn"
@@ -527,26 +562,26 @@ class JarvisAccessibilityService : AccessibilityService() {
                 for (n in nodes) {
                     val r = Rect()
                     n.getBoundsInScreen(r)
-                    if (r.width() > 20 && r.height() > 20 && r.top > 1000) {
+                    if (r.width() > 16 && r.height() > 16 && r.top > minTopForMic) {
                         return r
                     }
                 }
             }
         }
-        return findMicNodeByDescriptionRecursive(root)
+        return findMicNodeByDescriptionRecursive(root, minTopForMic)
     }
 
-    private fun findMicNodeByDescriptionRecursive(node: AccessibilityNodeInfo?): Rect? {
+    private fun findMicNodeByDescriptionRecursive(node: AccessibilityNodeInfo?, minTopForMic: Int): Rect? {
         if (node == null) return null
         val desc = node.contentDescription?.toString()?.lowercase().orEmpty()
         if (desc == "mensaje de voz" || desc == "botón de mensaje de voz" || desc == "voice message") {
             val r = Rect()
             node.getBoundsInScreen(r)
-            if (r.top > 1000 && r.width() > 20) return r
+            if (r.top > minTopForMic && r.width() > 16) return r
         }
         for (i in 0 until node.childCount) {
             val child = node.getChild(i) ?: continue
-            val res = findMicNodeByDescriptionRecursive(child)
+            val res = findMicNodeByDescriptionRecursive(child, minTopForMic)
             if (res != null) return res
         }
         return null
@@ -657,7 +692,8 @@ class JarvisAccessibilityService : AccessibilityService() {
     }
 
     private fun clickFirstSearchResultInWhatsApp(root: AccessibilityNodeInfo, query: String): Boolean {
-        if (clickNodeMatchingPhonetically(root, query, minTop = 230)) {
+        val minTop = chatContentMinTopPx()
+        if (clickNodeMatchingPhonetically(root, query, minTop = minTop)) {
             return true
         }
         val rowIds = listOf(
@@ -670,7 +706,7 @@ class JarvisAccessibilityService : AccessibilityService() {
                 for (n in nodes) {
                     val rect = Rect()
                     n.getBoundsInScreen(rect)
-                    if (rect.top > 230 && clickNodeOrParent(n)) {
+                    if (rect.top > minTop && clickNodeOrParent(n)) {
                         return true
                     }
                 }
@@ -683,23 +719,35 @@ class JarvisAccessibilityService : AccessibilityService() {
         val targetDay = normalize(requestedDayFilter ?: "hoy")
         val extracted = extractChatItemsByDayFromTree(root, targetDay)
 
-        val needsScrollUpToFindStartOfDay = !extracted.sawExactDayHeaderBanner && scrollAttemptsLeft > 0
+        val alreadyAboveToday = targetDay == "hoy" && extracted.sawOlderHeaderOnScreen
+        val needsScrollUpToFindStartOfDay = !extracted.sawExactDayHeaderBanner &&
+            !alreadyAboveToday &&
+            scrollAttemptsLeft > 0
 
         if (needsScrollUpToFindStartOfDay) {
             scrollAttemptsLeft--
             if (scrollChatListBackward(root)) {
                 autoInspectDayChatUntilTimestamp = System.currentTimeMillis() + 6000L
+                pendingChatInspectRunnable?.let { mainHandler.removeCallbacks(it) }
+                val nextInspect = Runnable {
+                    pendingChatInspectRunnable = null
+                    val fresh = rootInActiveWindow ?: return@Runnable
+                    processOpenChatForRequestedDay(fresh)
+                }
+                pendingChatInspectRunnable = nextInspect
+                mainHandler.postDelayed(nextInspect, 380L)
                 return
             }
         }
 
-        if (extracted.sawExactDayHeaderBanner && extracted.items.isEmpty() && extracted.headerTopY > 1200) {
+        val lowHeaderThreshold = (screenHeightPx() * 0.65f).toInt()
+        if (extracted.sawExactDayHeaderBanner && extracted.items.isEmpty() && extracted.headerTopY > lowHeaderThreshold) {
             if (scrollChatListForward(root)) {
                 mainHandler.postDelayed({
                     val fresh = rootInActiveWindow ?: return@postDelayed
                     val afterScrollDown = extractChatItemsByDayFromTree(fresh, targetDay)
                     deliverExtractedDayItems(afterScrollDown.items)
-                }, 650L)
+                }, 480L)
                 return
             }
         }
@@ -709,6 +757,8 @@ class JarvisAccessibilityService : AccessibilityService() {
 
     private fun deliverExtractedDayItems(items: List<ScreenChatItem>) {
         autoInspectDayChatUntilTimestamp = 0L
+        pendingChatInspectRunnable?.let { mainHandler.removeCallbacks(it) }
+        pendingChatInspectRunnable = null
         val cb = onDayChatItemsReadyCallback
         onDayChatItemsReadyCallback = null
         cb?.invoke(items)
@@ -736,11 +786,12 @@ class JarvisAccessibilityService : AccessibilityService() {
                 item.isAudio || !alreadyReadTexts.contains(item.text)
             }
             onMoreItemsLoaded(newItems)
-        }, 700L)
+        }, 480L)
     }
 
     private data class DayExtractionResult(
         val sawExactDayHeaderBanner: Boolean,
+        val sawOlderHeaderOnScreen: Boolean,
         val headerTopY: Int,
         val items: List<ScreenChatItem>
     )
@@ -760,16 +811,18 @@ class JarvisAccessibilityService : AccessibilityService() {
         val rawElements = mutableListOf<RawScreenElement>()
         collectChatScreenElements(root, rawElements)
 
+        val bucketPx = rowDedupBucketPx()
         val durationsOnScreen = rawElements.filter { it.type == "DURATION" && it.durationMs > 0L }
         val mainElements = rawElements
             .filter { it.type != "DURATION" }
             .sortedBy { it.topY }
-            .distinctBy { "${it.type}_${it.topY / 28}_${it.text.take(25)}" }
+            .distinctBy { "${it.type}_${it.topY / bucketPx}_${it.text.take(25)}" }
 
         val headers = mainElements.filter { it.type == "HEADER" }
 
         var currentSectionDay = if (headers.isEmpty()) targetDayNorm else "anterior_al_primer_cartel"
         var sawRequestedHeader = false
+        var sawOlderHeader = false
         var requestedHeaderTopY = 0
         val matchingItems = mutableListOf<RawScreenElement>()
 
@@ -780,6 +833,8 @@ class JarvisAccessibilityService : AccessibilityService() {
                 if (headerMatchesDay(hNorm, targetDayNorm)) {
                     sawRequestedHeader = true
                     requestedHeaderTopY = elem.topY
+                } else {
+                    sawOlderHeader = true
                 }
             } else {
                 if (headerMatchesDay(currentSectionDay, targetDayNorm)) {
@@ -788,7 +843,7 @@ class JarvisAccessibilityService : AccessibilityService() {
             }
         }
 
-        if (!sawRequestedHeader && matchingItems.isEmpty() && (scrollAttemptsLeft <= 0 || allowWithoutBannerIfContinuing)) {
+        if (!sawRequestedHeader && matchingItems.isEmpty() && (scrollAttemptsLeft <= 0 || allowWithoutBannerIfContinuing || (targetDayNorm == "hoy" && sawOlderHeader))) {
             if (headers.isEmpty()) {
                 if (targetDayNorm == "hoy" || allowWithoutBannerIfContinuing) {
                     matchingItems.addAll(mainElements.filter { it.type != "HEADER" })
@@ -807,6 +862,7 @@ class JarvisAccessibilityService : AccessibilityService() {
             }
         }
 
+        val maxDurDistancePx = (85f * densityScale()).toInt().coerceAtLeast(130)
         var audioCounter = 0
         val finalItems = matchingItems.map { raw ->
             if (raw.type == "AUDIO") {
@@ -814,12 +870,12 @@ class JarvisAccessibilityService : AccessibilityService() {
                 audioCounter++
                 val nearbyDuration = durationsOnScreen
                     .minByOrNull { abs(it.topY - raw.topY) }
-                    ?.takeIf { abs(it.topY - raw.topY) < 160 }
+                    ?.takeIf { abs(it.topY - raw.topY) < maxDurDistancePx }
                     ?.durationMs
                 val finalDurationMs = when {
                     raw.durationMs > 1000L -> raw.durationMs
                     nearbyDuration != null && nearbyDuration > 1000L -> nearbyDuration
-                    else -> 12_000L
+                    else -> 6_000L
                 }
                 ScreenChatItem(
                     isAudio = true,
@@ -841,6 +897,7 @@ class JarvisAccessibilityService : AccessibilityService() {
 
         return DayExtractionResult(
             sawExactDayHeaderBanner = sawRequestedHeader,
+            sawOlderHeaderOnScreen = sawOlderHeader,
             headerTopY = requestedHeaderTopY,
             items = finalItems
         )
@@ -897,7 +954,9 @@ class JarvisAccessibilityService : AccessibilityService() {
 
     private fun collectChatScreenElements(
         node: AccessibilityNodeInfo?,
-        outList: MutableList<RawScreenElement>
+        outList: MutableList<RawScreenElement>,
+        minTop: Int = chatContentMinTopPx(),
+        maxBottom: Int = chatContentMaxBottomPx()
     ) {
         if (node == null) return
         val viewId = node.viewIdResourceName?.lowercase().orEmpty()
@@ -909,7 +968,7 @@ class JarvisAccessibilityService : AccessibilityService() {
         val rect = Rect()
         node.getBoundsInScreen(rect)
 
-        if (rect.top in 165..2080 && rect.bottom > rect.top) {
+        if (rect.top in minTop..maxBottom && rect.bottom > rect.top) {
             val isDateDividerId = viewId.endsWith(":id/conversation_row_date_divider") ||
                 viewId.endsWith(":id/date_divider")
             val isDateBannerText = !node.isClickable && text.length in 3..32 && (
@@ -924,8 +983,8 @@ class JarvisAccessibilityService : AccessibilityService() {
                     lowerText == "sábado" ||
                     lowerText == "sabado" ||
                     lowerText == "domingo" ||
-                    lowerText.matches(Regex("\\d{1,2} de [a-záéíóú]+.*")) ||
-                    lowerText.matches(Regex("\\d{1,2}/\\d{1,2}/\\d{2,4}"))
+                    DATE_TEXT_LONG_REGEX.matches(lowerText) ||
+                    DATE_TEXT_SLASH_REGEX.matches(lowerText)
                 )
 
             if (isDateDividerId || isDateBannerText) {
@@ -935,18 +994,30 @@ class JarvisAccessibilityService : AccessibilityService() {
                 return
             }
 
-            val parsedDur = parseAudioDurationTextMs(text.ifEmpty { desc })
-            if (parsedDur > 0L && (viewId.endsWith(":id/description") || viewId.endsWith(":id/duration") || text.matches(Regex("^\\d{1,2}:\\d{2}$")))) {
-                outList.add(RawScreenElement("DURATION", text, rect.top, parsedDur))
+            val isDateTimestampNode = viewId.endsWith(":id/date")
+            if (!isDateTimestampNode) {
+                val parsedDur = parseAudioDurationTextMs(text.ifEmpty { desc })
+                if (parsedDur > 0L && (
+                        viewId.endsWith(":id/description") ||
+                            viewId.endsWith(":id/duration") ||
+                            viewId.endsWith(":id/audio_duration") ||
+                            lowerDesc.contains("mensaje de voz") ||
+                            MM_SS_EXACT_REGEX.matches(text)
+                        )
+                ) {
+                    outList.add(RawScreenElement("DURATION", text.ifEmpty { desc }, rect.top, parsedDur))
+                }
             }
 
-            val isAudioControl = lowerDesc == "reproducir" ||
+            val isAudioControl = viewId.endsWith(":id/control_btn") ||
+                viewId.endsWith(":id/audio_play_pause_btn") ||
+                lowerDesc == "reproducir" ||
                 lowerDesc.startsWith("reproducir ") ||
+                lowerDesc == "pausar" ||
+                lowerDesc.startsWith("pausar ") ||
                 lowerDesc == "play" ||
-                lowerDesc.contains("mensaje de voz") ||
-                lowerText == "reproducir" ||
-                viewId.endsWith(":id/control_btn") ||
-                viewId.endsWith(":id/audio_play_pause_btn")
+                lowerDesc == "pause" ||
+                lowerText == "reproducir"
 
             if (isAudioControl) {
                 val durFromDesc = parseAudioDurationTextMs(desc)
@@ -956,7 +1027,7 @@ class JarvisAccessibilityService : AccessibilityService() {
 
             val isMessageTextView = viewId.endsWith(":id/message_text") ||
                 viewId.endsWith(":id/caption")
-            if (isMessageTextView && text.isNotEmpty() && !text.matches(Regex("^\\d{1,2}:\\d{2}(\\s*[ap]\\.?\\s*m\\.?)?$", RegexOption.IGNORE_CASE))) {
+            if (isMessageTextView && text.isNotEmpty() && !TIME_ONLY_MSG_REGEX.matches(text)) {
                 outList.add(RawScreenElement("TEXT", text, rect.top))
                 return
             }
@@ -964,13 +1035,13 @@ class JarvisAccessibilityService : AccessibilityService() {
 
         for (i in 0 until node.childCount) {
             val child = node.getChild(i) ?: continue
-            collectChatScreenElements(child, outList)
+            collectChatScreenElements(child, outList, minTop, maxBottom)
         }
     }
 
     private fun parseAudioDurationTextMs(raw: String): Long {
         if (raw.isBlank()) return 0L
-        val mmSs = Regex("\\b(\\d{1,2}):(\\d{2})\\b").find(raw)
+        val mmSs = MM_SS_FIND_REGEX.find(raw)
         if (mmSs != null) {
             val mins = mmSs.groupValues[1].toLongOrNull() ?: return 0L
             val secs = mmSs.groupValues[2].toLongOrNull() ?: return 0L
@@ -978,10 +1049,11 @@ class JarvisAccessibilityService : AccessibilityService() {
                 return (mins * 60L + secs) * 1000L
             }
         }
-        val secMatch = Regex("(\\d+)\\s*seg").find(raw.lowercase())
+        val lower = raw.lowercase()
+        val secMatch = SEC_FIND_REGEX.find(lower)
         if (secMatch != null) {
             val s = secMatch.groupValues[1].toLongOrNull() ?: 0L
-            val mMatch = Regex("(\\d+)\\s*min").find(raw.lowercase())
+            val mMatch = MIN_FIND_REGEX.find(lower)
             val m = mMatch?.groupValues?.getOrNull(1)?.toLongOrNull() ?: 0L
             if (m > 0 || s > 0) {
                 return (m * 60L + s) * 1000L
@@ -1001,12 +1073,16 @@ class JarvisAccessibilityService : AccessibilityService() {
         if (desc.contains("paus")) return true
 
         lastVoiceNoteClickTime = System.currentTimeMillis()
-        return clickNodeOrParent(latestButton)
+        return clickAudioNodeWithFallback(latestButton)
     }
 
-    fun clickAudioInCurrentScreenByDayOrder(targetDayRaw: String, audioOrderInDay: Int): Boolean {
+    fun clickAudioInCurrentScreenByDayOrder(
+        targetDayRaw: String,
+        audioOrderInDay: Int,
+        expectedTopY: Int = -1
+    ): Boolean {
         val now = System.currentTimeMillis()
-        if (now < lastVoiceNoteClickTime + 900L) return false
+        if (now < lastVoiceNoteClickTime + 300L) return false
 
         val root = rootInActiveWindow ?: return false
         val targetDayNorm = normalize(targetDayRaw.ifBlank { "hoy" })
@@ -1015,13 +1091,14 @@ class JarvisAccessibilityService : AccessibilityService() {
         val audioButtons = mutableListOf<Pair<Int, AccessibilityNodeInfo>>()
         collectHeadersAndAudioButtons(root, headers, audioButtons)
 
+        val bucketPx = rowDedupBucketPx()
         val sortedHeaders = headers.sortedBy { it.topY }
         val sortedButtons = audioButtons
             .sortedBy { it.first }
-            .distinctBy { it.first / 28 }
+            .distinctBy { it.first / bucketPx }
 
-        val matchingButtons = if (sortedHeaders.isEmpty()) {
-            sortedButtons.map { it.second }
+        val matchingButtonsWithTop: List<Pair<Int, AccessibilityNodeInfo>> = if (sortedHeaders.isEmpty()) {
+            sortedButtons
         } else {
             val filtered = sortedButtons.filter { (btnTop, _) ->
                 val headerAbove = sortedHeaders.lastOrNull { it.topY < btnTop }
@@ -1031,14 +1108,21 @@ class JarvisAccessibilityService : AccessibilityService() {
                     (targetDayNorm == "hoy" && sortedHeaders.none { headerMatchesDay(normalize(it.text), "hoy") }) ||
                         (targetDayNorm == "ayer" && headerMatchesDay(normalize(sortedHeaders.first().text), "hoy"))
                 }
-            }.map { it.second }
-            filtered.ifEmpty { sortedButtons.map { it.second } }
+            }
+            filtered.ifEmpty { sortedButtons }
         }
 
-        val targetNode = matchingButtons.getOrNull(audioOrderInDay)
-            ?: sortedButtons.getOrNull(audioOrderInDay)?.second
-            ?: return false
+        val maxTopDriftPx = (75f * densityScale()).toInt().coerceAtLeast(110)
+        val byOrder = matchingButtonsWithTop.getOrNull(audioOrderInDay)
+        val targetPair = when {
+            byOrder != null && (expectedTopY <= 0 || abs(byOrder.first - expectedTopY) <= maxTopDriftPx) -> byOrder
+            expectedTopY > 0 -> matchingButtonsWithTop.minByOrNull { abs(it.first - expectedTopY) }
+                ?: byOrder
+                ?: sortedButtons.getOrNull(audioOrderInDay)
+            else -> byOrder ?: sortedButtons.getOrNull(audioOrderInDay)
+        } ?: return false
 
+        val targetNode = targetPair.second
         val desc = targetNode.contentDescription?.toString()?.lowercase().orEmpty()
         val txt = targetNode.text?.toString()?.lowercase().orEmpty()
         if (desc.contains("paus") || txt.contains("paus")) {
@@ -1046,12 +1130,52 @@ class JarvisAccessibilityService : AccessibilityService() {
         }
 
         lastVoiceNoteClickTime = now
-        return clickNodeOrParent(targetNode)
+        return clickAudioNodeWithFallback(targetNode)
+    }
+
+    private fun clickAudioNodeWithFallback(node: AccessibilityNodeInfo): Boolean {
+        if (clickNodeOrParent(node)) return true
+        val rect = Rect()
+        node.getBoundsInScreen(rect)
+        if (rect.width() > 10 && rect.height() > 10) {
+            val cx = rect.exactCenterX()
+            val cy = rect.exactCenterY()
+            val path = Path().apply {
+                moveTo(cx, cy)
+                lineTo(cx, cy)
+            }
+            val stroke = GestureDescription.StrokeDescription(path, 0L, 65L)
+            val gesture = GestureDescription.Builder().addStroke(stroke).build()
+            return dispatchGesture(gesture, null, null)
+        }
+        return false
     }
 
     fun pauseAnyPlayingVoiceNoteOnScreen() {
         val root = rootInActiveWindow ?: return
-        pausePlayingNodeRecursive(root)
+        val audioBtnIds = listOf(
+            "com.whatsapp:id/control_btn",
+            "com.whatsapp:id/audio_play_pause_btn",
+            "com.whatsapp.w4b:id/control_btn",
+            "com.whatsapp.w4b:id/audio_play_pause_btn"
+        )
+        var checkedById = false
+        for (id in audioBtnIds) {
+            val nodes = root.findAccessibilityNodeInfosByViewId(id)
+            if (!nodes.isNullOrEmpty()) {
+                checkedById = true
+                for (n in nodes) {
+                    val desc = n.contentDescription?.toString()?.lowercase().orEmpty()
+                    val txt = n.text?.toString()?.lowercase().orEmpty()
+                    if (desc.contains("paus") || txt.contains("paus")) {
+                        if (clickNodeOrParent(n)) return
+                    }
+                }
+            }
+        }
+        if (!checkedById) {
+            pausePlayingNodeRecursive(root)
+        }
     }
 
     private fun pausePlayingNodeRecursive(node: AccessibilityNodeInfo?): Boolean {
@@ -1070,6 +1194,25 @@ class JarvisAccessibilityService : AccessibilityService() {
 
     fun isAnyVoiceNoteCurrentlyPlayingOnScreen(): Boolean {
         val root = rootInActiveWindow ?: return false
+        val audioBtnIds = listOf(
+            "com.whatsapp:id/control_btn",
+            "com.whatsapp:id/audio_play_pause_btn",
+            "com.whatsapp.w4b:id/control_btn",
+            "com.whatsapp.w4b:id/audio_play_pause_btn"
+        )
+        var foundAnyAudioControlById = false
+        for (id in audioBtnIds) {
+            val nodes = root.findAccessibilityNodeInfosByViewId(id)
+            if (!nodes.isNullOrEmpty()) {
+                foundAnyAudioControlById = true
+                for (n in nodes) {
+                    val desc = n.contentDescription?.toString()?.lowercase().orEmpty()
+                    val txt = n.text?.toString()?.lowercase().orEmpty()
+                    if (desc.contains("paus") || txt.contains("paus")) return true
+                }
+            }
+        }
+        if (foundAnyAudioControlById) return false
         return hasPauseButtonNode(root)
     }
 
@@ -1088,7 +1231,9 @@ class JarvisAccessibilityService : AccessibilityService() {
     private fun collectHeadersAndAudioButtons(
         node: AccessibilityNodeInfo?,
         headersOut: MutableList<RawScreenElement>,
-        buttonsOut: MutableList<Pair<Int, AccessibilityNodeInfo>>
+        buttonsOut: MutableList<Pair<Int, AccessibilityNodeInfo>>,
+        minTop: Int = chatContentMinTopPx(),
+        maxBottom: Int = chatContentMaxBottomPx()
     ) {
         if (node == null) return
         val viewId = node.viewIdResourceName?.lowercase().orEmpty()
@@ -1100,7 +1245,7 @@ class JarvisAccessibilityService : AccessibilityService() {
         val rect = Rect()
         node.getBoundsInScreen(rect)
 
-        if (rect.top in 165..2080 && rect.bottom > rect.top) {
+        if (rect.top in minTop..maxBottom && rect.bottom > rect.top) {
             val isDateDivider = viewId.endsWith(":id/conversation_row_date_divider") ||
                 viewId.endsWith(":id/date_divider") ||
                 (!node.isClickable && text.length in 3..32 && (
@@ -1110,21 +1255,24 @@ class JarvisAccessibilityService : AccessibilityService() {
                         lowerText == "jueves" || lowerText == "viernes" ||
                         lowerText == "sábado" || lowerText == "sabado" ||
                         lowerText == "domingo" ||
-                        lowerText.matches(Regex("\\d{1,2} de [a-záéíóú]+.*")) ||
-                        lowerText.matches(Regex("\\d{1,2}/\\d{1,2}/\\d{2,4}"))
+                        DATE_TEXT_LONG_REGEX.matches(lowerText) ||
+                        DATE_TEXT_SLASH_REGEX.matches(lowerText)
                     ))
             if (isDateDivider && text.isNotEmpty()) {
                 headersOut.add(RawScreenElement("HEADER", text, rect.top))
                 return
             }
 
-            val isAudioBtn = lowerDesc == "reproducir" ||
+            val isAudioBtn = viewId.endsWith(":id/control_btn") ||
+                viewId.endsWith(":id/audio_play_pause_btn") ||
+                lowerDesc == "reproducir" ||
                 lowerDesc.startsWith("reproducir ") ||
+                lowerDesc == "pausar" ||
+                lowerDesc.startsWith("pausar ") ||
                 lowerDesc == "play" ||
+                lowerDesc == "pause" ||
                 lowerDesc.contains("paus") ||
-                lowerText == "reproducir" ||
-                viewId.endsWith(":id/control_btn") ||
-                viewId.endsWith(":id/audio_play_pause_btn")
+                lowerText == "reproducir"
 
             if (isAudioBtn) {
                 buttonsOut.add(Pair(rect.top, node))
@@ -1134,7 +1282,7 @@ class JarvisAccessibilityService : AccessibilityService() {
 
         for (i in 0 until node.childCount) {
             val child = node.getChild(i) ?: continue
-            collectHeadersAndAudioButtons(child, headersOut, buttonsOut)
+            collectHeadersAndAudioButtons(child, headersOut, buttonsOut, minTop, maxBottom)
         }
     }
 
@@ -1230,9 +1378,9 @@ class JarvisAccessibilityService : AccessibilityService() {
             .replace("ce", "se")
             .replace("ci", "si")
             .replace("h", "")
-            .replace(Regex("([a-z])\\1+"), "$1")
-            .replace(Regex("[^a-z0-9 ]"), " ")
-            .replace(Regex("\\s+"), " ")
+            .replace(REPEATED_LETTERS_REGEX, "$1")
+            .replace(NON_ALPHANUM_REGEX, " ")
+            .replace(MULTI_SPACE_REGEX, " ")
             .trim()
     }
 
@@ -1301,7 +1449,7 @@ class JarvisAccessibilityService : AccessibilityService() {
         ) {
             val rect = Rect()
             node.getBoundsInScreen(rect)
-            if (rect.top in 220..1800 && (rect.bottom - rect.top) > 100) {
+            if (rect.top in chatContentMinTopPx()..chatContentMaxBottomPx() && (rect.bottom - rect.top) > 80) {
                 outList.add(Pair(rect.top, node))
             }
         }
@@ -1346,7 +1494,7 @@ class JarvisAccessibilityService : AccessibilityService() {
 
     private fun normalize(input: String): String {
         val temp = Normalizer.normalize(input.lowercase(Locale.getDefault()).trim(), Normalizer.Form.NFD)
-        return Regex("\\p{InCombiningDiacriticalMarks}+").replace(temp, "")
+        return DIACRITICS_REGEX.replace(temp, "")
     }
 
     override fun onInterrupt() {}
@@ -1360,6 +1508,18 @@ class JarvisAccessibilityService : AccessibilityService() {
     }
 
     companion object {
+        private val DATE_TEXT_LONG_REGEX = Regex("\\d{1,2} de [a-záéíóú]+.*")
+        private val DATE_TEXT_SLASH_REGEX = Regex("\\d{1,2}/\\d{1,2}/\\d{2,4}")
+        private val MM_SS_EXACT_REGEX = Regex("^\\d{1,2}:\\d{2}$")
+        private val MM_SS_FIND_REGEX = Regex("\\b(\\d{1,2}):(\\d{2})\\b")
+        private val SEC_FIND_REGEX = Regex("(\\d+)\\s*seg")
+        private val MIN_FIND_REGEX = Regex("(\\d+)\\s*min")
+        private val TIME_ONLY_MSG_REGEX = Regex("^\\d{1,2}:\\d{2}(\\s*[ap]\\.?\\s*m\\.?)?$", RegexOption.IGNORE_CASE)
+        private val DIACRITICS_REGEX = Regex("\\p{InCombiningDiacriticalMarks}+")
+        private val REPEATED_LETTERS_REGEX = Regex("([a-z])\\1+")
+        private val NON_ALPHANUM_REGEX = Regex("[^a-z0-9 ]")
+        private val MULTI_SPACE_REGEX = Regex("\\s+")
+
         @Volatile
         var instance: JarvisAccessibilityService? = null
             private set
@@ -1460,8 +1620,8 @@ class JarvisAccessibilityService : AccessibilityService() {
             val cleanDay = dayFilter.ifBlank { "hoy" }.lowercase().trim()
             requestedDayFilter = cleanDay
             onDayChatItemsReadyCallback = onReady
-            instance?.scrollAttemptsLeft = if (cleanDay == "hoy") 8 else 20
-            autoInspectDayChatUntilTimestamp = System.currentTimeMillis() + 20_000L
+            instance?.scrollAttemptsLeft = if (cleanDay == "hoy") 4 else 10
+            autoInspectDayChatUntilTimestamp = System.currentTimeMillis() + 18_000L
         }
 
         fun requestAutoPlayInYouTube() {

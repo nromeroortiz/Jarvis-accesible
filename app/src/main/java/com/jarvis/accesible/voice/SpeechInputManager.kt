@@ -38,12 +38,24 @@ class SpeechInputManager(
     @Volatile
     private var isWakeWordLoopActive: Boolean = false
 
+    private val wakeWordCycleRunnable = Runnable {
+        startWakeWordSingleCycle()
+    }
+
+    private fun scheduleNextWakeWordCycle(delayMs: Long) {
+        mainHandler.removeCallbacks(wakeWordCycleRunnable)
+        if (AppPrefs.isWakeWordEnabled(context) && !isActivelyListeningCommand) {
+            mainHandler.postDelayed(wakeWordCycleRunnable, delayMs)
+        }
+    }
+
     fun startCommandListening() {
         startCommandListeningInternal(hasRetried = false)
     }
 
     private fun startCommandListeningInternal(hasRetried: Boolean) {
         mainHandler.post {
+            mainHandler.removeCallbacks(wakeWordCycleRunnable)
             isWakeWordLoopActive = false
             isActivelyListeningCommand = true
             onListeningStateChanged?.invoke(true)
@@ -154,8 +166,9 @@ class SpeechInputManager(
 
     fun syncWakeWordLoop() {
         mainHandler.post {
+            mainHandler.removeCallbacks(wakeWordCycleRunnable)
             if (AppPrefs.isWakeWordEnabled(context) && !isActivelyListeningCommand) {
-                startWakeWordSingleCycle()
+                scheduleNextWakeWordCycle(600L)
             } else if (!AppPrefs.isWakeWordEnabled(context) && !isActivelyListeningCommand) {
                 isWakeWordLoopActive = false
                 destroyRecognizer()
@@ -165,6 +178,7 @@ class SpeechInputManager(
 
     fun stopAllListening() {
         mainHandler.post {
+            mainHandler.removeCallbacks(wakeWordCycleRunnable)
             isActivelyListeningCommand = false
             isWakeWordLoopActive = false
             onListeningStateChanged?.invoke(false)
@@ -173,19 +187,16 @@ class SpeechInputManager(
     }
 
     private fun scheduleWakeWordResumeIfEnabled() {
-        mainHandler.postDelayed({
-            if (AppPrefs.isWakeWordEnabled(context) && !isActivelyListeningCommand) {
-                startWakeWordSingleCycle()
-            }
-        }, 2000L)
+        scheduleNextWakeWordCycle(2600L)
     }
 
     private fun startWakeWordSingleCycle() {
+        mainHandler.removeCallbacks(wakeWordCycleRunnable)
         if (isActivelyListeningCommand || !AppPrefs.isWakeWordEnabled(context)) return
         if (ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) return
 
         // Si el usuario está viendo un video o escuchando música/audio (Instagram, TikTok, YouTube, Spotify, WhatsApp)
-        // o si Wally está hablando, NO abrimos el SpeechRecognizer ambiental para nunca pausarle el video.
+        // o si Wally está hablando (o recién terminó de hablar hace menos de 1.5s), NO abrimos el micrófono.
         val isMediaPlayingNow = try {
             audioManager.isMusicActive
         } catch (_: Exception) {
@@ -193,7 +204,7 @@ class SpeechInputManager(
         }
         if (isMediaPlayingNow || isBusySpeakingOrPlaying?.invoke() == true) {
             destroyRecognizer()
-            mainHandler.postDelayed({ startWakeWordSingleCycle() }, 3000L)
+            scheduleNextWakeWordCycle(2800L)
             return
         }
 
@@ -211,12 +222,19 @@ class SpeechInputManager(
                 override fun onEndOfSpeech() {}
 
                 override fun onError(error: Int) {
-                    if (AppPrefs.isWakeWordEnabled(context) && !isActivelyListeningCommand) {
-                        mainHandler.postDelayed({ startWakeWordSingleCycle() }, 2000L)
+                    val cooldown = if (error == SpeechRecognizer.ERROR_RECOGNIZER_BUSY || error == SpeechRecognizer.ERROR_CLIENT) {
+                        3500L
+                    } else {
+                        2400L
                     }
+                    scheduleNextWakeWordCycle(cooldown)
                 }
 
                 override fun onResults(results: Bundle?) {
+                    if (isBusySpeakingOrPlaying?.invoke() == true) {
+                        scheduleNextWakeWordCycle(2600L)
+                        return
+                    }
                     val matches = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
                     val heard = matches?.firstOrNull()?.lowercase()?.trim() ?: ""
                     val customWake = AppPrefs.getWakeWordPhrase(context).lowercase().trim()
@@ -230,8 +248,8 @@ class SpeechInputManager(
                     if (match != null) {
                         val commandAfterWakeWord = match.groupValues.getOrNull(1)?.trim().orEmpty()
                         onWakeWordDetected(commandAfterWakeWord.ifEmpty { null })
-                    } else if (AppPrefs.isWakeWordEnabled(context) && !isActivelyListeningCommand) {
-                        mainHandler.postDelayed({ startWakeWordSingleCycle() }, 1000L)
+                    } else {
+                        scheduleNextWakeWordCycle(1500L)
                     }
                 }
 
@@ -250,7 +268,7 @@ class SpeechInputManager(
         try {
             speechRecognizer?.startListening(intent)
         } catch (_: Exception) {
-            mainHandler.postDelayed({ startWakeWordSingleCycle() }, 2500L)
+            scheduleNextWakeWordCycle(3000L)
         }
     }
 

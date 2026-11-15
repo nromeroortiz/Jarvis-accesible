@@ -32,6 +32,15 @@ class SpeakerManager(private val context: Context) : TextToSpeech.OnInitListener
     var isSpeakingNow: Boolean = false
         private set
 
+    @Volatile
+    var lastSpeechEndedTimestamp: Long = 0L
+        private set
+
+    fun isSpeakingOrRecentlyFinished(cooldownMs: Long = 1400L): Boolean {
+        if (isSpeakingNow) return true
+        return (System.currentTimeMillis() - lastSpeechEndedTimestamp) < cooldownMs
+    }
+
     init {
         try {
             tts = TextToSpeech(context.applicationContext, this)
@@ -72,6 +81,7 @@ class SpeakerManager(private val context: Context) : TextToSpeech.OnInitListener
                         completeUtterance(utteranceId)
                     } else {
                         isSpeakingNow = false
+                        lastSpeechEndedTimestamp = System.currentTimeMillis()
                         abandonAudioFocus()
                     }
                 }
@@ -82,6 +92,7 @@ class SpeakerManager(private val context: Context) : TextToSpeech.OnInitListener
 
     private fun completeUtterance(utteranceId: String?) {
         isSpeakingNow = false
+        lastSpeechEndedTimestamp = System.currentTimeMillis()
         abandonAudioFocus()
         if (utteranceId != null) {
             val callback = pendingCallbacks.remove(utteranceId)
@@ -141,6 +152,7 @@ class SpeakerManager(private val context: Context) : TextToSpeech.OnInitListener
     fun stopSpeaking() {
         pendingCallbacks.clear()
         isSpeakingNow = false
+        lastSpeechEndedTimestamp = System.currentTimeMillis()
         tts?.stop()
         abandonAudioFocus()
     }

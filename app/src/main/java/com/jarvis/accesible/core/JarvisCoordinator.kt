@@ -90,11 +90,15 @@ class JarvisCoordinator private constructor(private val context: Context) {
             isListeningUiState = listening
         },
         isBusySpeakingOrPlaying = {
-            speaker.isSpeakingNow ||
+            speaker.isSpeakingOrRecentlyFinished(1500L) ||
                 WhatsAppRepository.isCurrentlyPlayingOrRecordingAudio() ||
                 (JarvisAccessibilityService.instance?.isMediaAppInForeground() == true)
         }
     )
+
+    init {
+        WhatsAppRepository.preloadInBackground(context)
+    }
 
     fun triggerHandsFreeListening(greetBeforeListening: Boolean = false) {
         // Pausamos cualquier lectura o audio en pantalla de WhatsApp para que el micrófono escuche limpio ("Siguiente", "Anterior", etc.)
