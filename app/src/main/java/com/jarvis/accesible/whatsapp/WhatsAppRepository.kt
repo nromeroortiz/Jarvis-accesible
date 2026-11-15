@@ -24,9 +24,7 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
 import java.text.Normalizer
-import java.text.SimpleDateFormat
 import java.util.Calendar
-import java.util.Date
 import java.util.Locale
 import java.util.concurrent.CopyOnWriteArrayList
 
@@ -51,13 +49,6 @@ data class UnifiedChatEntry(
     val dayFilter: String = "hoy"
 )
 
-/**
- * Gestiona toda la interacción con WhatsApp:
- * - Coincidencia fonética inteligente ("Dayana UNLa" <-> "Daiana UNLa").
- * - Unifica textos y audios (recibidos y enviados) sin discriminar, ordenados SIEMPRE DEL PRIMERO AL ÚLTIMO del día elegido.
- * - Respeta la duración real de cada audio (ej. 0:45) antes de pasar al siguiente elemento, permitiendo decir "Siguiente" o "Anterior".
- * - Al terminar de leer un día anterior ("ayer", "viernes", etc.), pregunta si quiere continuar con los mensajes de hoy.
- */
 object WhatsAppRepository {
 
     private val messages = CopyOnWriteArrayList<WhatsAppIncomingMessage>()
@@ -70,23 +61,8 @@ object WhatsAppRepository {
     private var activeRecordingOnCompleted: ((String) -> Unit)? = null
     private val mainHandler = Handler(Looper.getMainLooper())
 
-    fun isCurrentlyRecordingVoiceNote(): Boolean = mediaRecorder != null
-
-    fun finishActiveVoiceNoteRecordingIfAny(context: Context): Boolean {
-        if (mediaRecorder == null) return false
-        val name = activeRecordingContactName ?: "contacto"
-        val phone = activeRecordingContactPhone
-        val cb = activeRecordingOnCompleted
-        activeRecordingContactName = null
-        activeRecordingContactPhone = null
-        activeRecordingOnCompleted = null
-        finishRecordingAndShareToWhatsApp(context, name, phone) { msg ->
-            cb?.invoke(msg)
-        }
-        return true
-    }
-
     private var activeQueue: List<UnifiedChatEntry> = emptyList()
+    private val alreadyReadTextsInCurrentDay = mutableSetOf<String>()
 
     @Volatile
     private var activeQueueIndex: Int = 0
@@ -111,7 +87,28 @@ object WhatsAppRepository {
         } catch (_: Exception) {
             false
         }
-        return mpPlaying || mediaRecorder != null
+        return mpPlaying || mediaRecorder != null || JarvisAccessibilityService.isNativeWhatsAppRecordingActive
+    }
+
+    fun isCurrentlyRecordingVoiceNote(): Boolean =
+        mediaRecorder != null || JarvisAccessibilityService.isNativeWhatsAppRecordingActive
+
+    fun finishActiveVoiceNoteRecordingIfAny(context: Context): Boolean {
+        if (JarvisAccessibilityService.isNativeWhatsAppRecordingActive) {
+            JarvisAccessibilityService.instance?.finishAndSendNativeWhatsAppRecordingNow()
+            return true
+        }
+        if (mediaRecorder == null) return false
+        val name = activeRecordingContactName ?: "contacto"
+        val phone = activeRecordingContactPhone
+        val cb = activeRecordingOnCompleted
+        activeRecordingContactName = null
+        activeRecordingContactPhone = null
+        activeRecordingOnCompleted = null
+        finishRecordingAndShareToWhatsApp(context, name, phone) { msg ->
+            cb?.invoke(msg)
+        }
+        return true
     }
 
     fun ensureHistoryLoaded(context: Context) {
@@ -236,36 +233,141 @@ object WhatsAppRepository {
         saveHistoryToDisk(context)
     }
 
-    fun getUnreadSummary(context: Context): String {
+    /**
+     * MODO RÁPIDO DE CHARLA EN VIVO ("¿Tengo mensajes?", "¿Hay algún mensaje?"):
+     * - Te dice quién te escribió y te lee directamente los mensajes nuevos.
+     * - Si el mensaje nuevo es un audio, apenas termina de avisarte ("Fulano mandó un audio"),
+     *   reproduce ÚNICAMENTE ese audio nuevo (sin volver al principio del día).
+     */
+    fun checkAndPlayUnreadImmediately(
+        context: Context,
+        speakCallback: (String, (() -> Unit)?) -> Unit
+    ) {
         ensureHistoryLoaded(context)
+        stopAudioPlayback()
+        autoAdvanceGeneration++
+
         val unread = messages.filter { !it.isReadByUncle }
         if (unread.isEmpty()) {
-            return "No tenés mensajes nuevos."
+            speakCallback("No tenés mensajes nuevos.", null)
+            return
         }
 
-        val grouped = unread.groupBy { it.senderName }
-        // Guardamos el último remitente nombrado para que si el usuario dice "Contestale" sepa a quién responder
         lastOpenedContactName = unread.last().senderName
-
-        val parts = grouped.map { (sender, list) ->
-            val audioCount = list.count { it.isVoiceNote }
-            val textCount = list.size - audioCount
-            when {
-                audioCount > 0 && textCount > 0 -> "$sender mandó $textCount mensajes y $audioCount audios"
-                audioCount == 1 -> "$sender mandó 1 audio"
-                audioCount > 1 -> "$sender mandó $audioCount audios"
-                textCount == 1 -> "$sender mandó 1 mensaje: \"${list.last().text}\""
-                else -> "$sender mandó $textCount mensajes. El último dice: \"${list.last().text}\""
-            }
-        }
         unread.forEach { it.isReadByUncle = true }
         saveHistoryToDisk(context)
-        return parts.joinToString(". ") + "."
+
+        // Armamos una cola rápida SOLO con los mensajes/audios nuevos sin leer (no todo el día)
+        val liveQueue = unread.map { msg ->
+            if (msg.isVoiceNote) {
+                val localFile = msg.associatedAudioPath?.let { File(it) }?.takeIf { it.exists() }
+                    ?: findLatestWhatsAppVoiceNoteFile(maxAgeMillis = 600_000L)
+                UnifiedChatEntry(
+                    isAudio = true,
+                    spokenText = "${msg.senderName} mandó un audio.",
+                    localAudioFile = localFile,
+                    screenAudioOrderInDay = -99, // Señal de reproducir solo el último audio en el chat de msg.senderName
+                    dayFilter = msg.senderName
+                )
+            } else {
+                UnifiedChatEntry(
+                    isAudio = false,
+                    spokenText = "${msg.senderName} dice: ${msg.text}.",
+                    dayFilter = "hoy"
+                )
+            }
+        }
+
+        activeQueue = liveQueue
+        activeQueueIndex = 0
+        playLiveUnreadQueue(context, speakCallback)
+    }
+
+    private fun playLiveUnreadQueue(
+        context: Context,
+        speakCallback: (String, (() -> Unit)?) -> Unit
+    ) {
+        if (activeQueueIndex !in activeQueue.indices) return
+        val currentGen = ++autoAdvanceGeneration
+        val entry = activeQueue[activeQueueIndex]
+
+        if (!entry.isAudio) {
+            speakCallback(entry.spokenText) {
+                if (currentGen == autoAdvanceGeneration && activeQueueIndex + 1 <= activeQueue.lastIndex) {
+                    activeQueueIndex++
+                    playLiveUnreadQueue(context, speakCallback)
+                }
+            }
+        } else {
+            // Primero anuncia "Fulano mandó un audio" y en el acto lo reproduce
+            speakCallback(entry.spokenText) {
+                if (currentGen != autoAdvanceGeneration) return@speakCallback
+                if (entry.localAudioFile != null && entry.localAudioFile.exists()) {
+                    playSingleAudioFile(entry.localAudioFile) { _, _ ->
+                        if (currentGen == autoAdvanceGeneration && activeQueueIndex + 1 <= activeQueue.lastIndex) {
+                            activeQueueIndex++
+                            playLiveUnreadQueue(context, speakCallback)
+                        }
+                    }
+                } else {
+                    playLatestSingleAudioOnly(context, entry.dayFilter, speakCallback)
+                }
+            }
+        }
     }
 
     /**
-     * Abre el chat de una persona (usando coincidencia fonética en la agenda o buscándola con la lupa).
+     * Cuando el usuario dice "Reproducilo", "Escuchalo" o "Reproducí el último audio":
+     * Reproduce ÚNICAMENTE ese último audio recibido (sin ir al primer audio del día).
      */
+    fun playLatestSingleAudioOnly(
+        context: Context,
+        senderHint: String?,
+        speakCallback: (String, (() -> Unit)?) -> Unit
+    ) {
+        stopAudioPlayback()
+        autoAdvanceGeneration++
+
+        val recentFile = findLatestWhatsAppVoiceNoteFile(maxAgeMillis = 900_000L)
+        if (recentFile != null && senderHint.isNullOrBlank()) {
+            playSingleAudioFile(recentFile) { ok, err ->
+                if (!ok && err.isNotBlank()) speakCallback(err, null)
+            }
+            return
+        }
+
+        val targetPerson = senderHint?.takeIf { it.isNotBlank() } ?: lastOpenedContactName
+        if (!targetPerson.isNullOrBlank()) {
+            val contact = findContactByName(context, targetPerson)
+            if (contact != null) {
+                lastOpenedContactName = contact.first
+                JarvisAccessibilityService.requestPlayLatestSingleAudioInOpenChat()
+                openWhatsAppChatByPhone(context, contact.second)
+                return
+            } else {
+                lastOpenedContactName = targetPerson
+                JarvisAccessibilityService.requestSearchAndOpenChatInWhatsApp(targetPerson) {
+                    JarvisAccessibilityService.requestPlayLatestSingleAudioInOpenChat()
+                }
+                launchWhatsAppHome(context)
+                return
+            }
+        }
+
+        // Si el chat ya está abierto en pantalla o hay archivos .opus locales, reproducimos solo el último
+        val clickedOnScreen = JarvisAccessibilityService.instance?.clickLatestAudioInCurrentChatScreen() ?: false
+        if (clickedOnScreen) return
+
+        val lastOpus = getRecentOpusFilesNewestFirst(limit = 1).firstOrNull()
+        if (lastOpus != null) {
+            playSingleAudioFile(lastOpus) { ok, err ->
+                if (!ok && err.isNotBlank()) speakCallback(err, null)
+            }
+        } else {
+            speakCallback("No encontré el audio para reproducir.", null)
+        }
+    }
+
     fun openContactChatOnly(context: Context, personQuery: String): String {
         ensureHistoryLoaded(context)
         val contact = findContactByName(context, personQuery)
@@ -294,9 +396,9 @@ object WhatsAppRepository {
     }
 
     /**
-     * Inicia la lectura y reproducción unificada (textos + audios recibidos y enviados sin discriminar)
-     * DEL PRIMERO AL ÚLTIMO del día elegido ("hoy", "ayer", "viernes", etc.).
-     * Al finalizar un día anterior ("ayer", "viernes", etc.), invoca onPastDayFinished para preguntar si quiere seguir con los de hoy.
+     * MODO HISTORIAL POR DÍA ("Leeme los mensajes de hoy/ayer/viernes de X"):
+     * Sube hasta el cartel de ese día para arrancar SIEMPRE desde el primer mensaje de ese día hasta el último,
+     * y si el día es largo, baja con scroll automáticamente para seguir leyendo hasta terminar ese día.
      */
     fun startDayChatPlaybackFromFirstToLast(
         context: Context,
@@ -308,6 +410,7 @@ object WhatsAppRepository {
         ensureHistoryLoaded(context)
         stopAudioPlayback()
         autoAdvanceGeneration++
+        alreadyReadTextsInCurrentDay.clear()
 
         val dayFilter = dayFilterRaw?.ifBlank { "hoy" } ?: "hoy"
         val targetPerson = senderQuery?.takeIf { it.isNotBlank() } ?: lastOpenedContactName
@@ -323,24 +426,7 @@ object WhatsAppRepository {
             val onChatReadyToInspect = {
                 JarvisAccessibilityService.requestInspectOpenChatForDay(dayFilter) { screenItems ->
                     if (screenItems.isNotEmpty()) {
-                        activeQueue = screenItems.map { item: ScreenChatItem ->
-                            if (item.isAudio) {
-                                UnifiedChatEntry(
-                                    isAudio = true,
-                                    spokenText = "",
-                                    screenAudioOrderInDay = item.audioOrderInDay,
-                                    audioDurationMs = item.audioDurationMs,
-                                    dayFilter = dayFilter
-                                )
-                            } else {
-                                UnifiedChatEntry(
-                                    isAudio = false,
-                                    spokenText = item.text,
-                                    audioDurationMs = 0L,
-                                    dayFilter = dayFilter
-                                )
-                            }
-                        }
+                        activeQueue = mapScreenItemsToEntries(screenItems, dayFilter)
                         activeQueueIndex = 0
                         playCurrentQueueEntryAndAutoAdvance(context, speakCallback)
                     } else {
@@ -368,7 +454,6 @@ object WhatsAppRepository {
             return
         }
 
-        // Si no especificó persona, leemos los mensajes/audios guardados del día elegido del primero al último
         activeQueueContactName = null
         val entries = buildGeneralDayEntriesFromFirstToLast(dayFilter)
         if (entries.isEmpty()) {
@@ -381,52 +466,28 @@ object WhatsAppRepository {
         playCurrentQueueEntryAndAutoAdvance(context, speakCallback)
     }
 
-    fun playSingleRequestedVoiceNote(
-        context: Context,
-        senderHint: String?,
-        whichOffsetFromEnd: Int = 1,
-        speakCallback: (String, (() -> Unit)?) -> Unit
-    ) {
-        stopAudioPlayback()
-        autoAdvanceGeneration++
-
-        val effectiveSender = senderHint?.takeIf { it.isNotBlank() } ?: lastOpenedContactName
-        if (!effectiveSender.isNullOrBlank() && !senderHint.isNullOrBlank()) {
-            startDayChatPlaybackFromFirstToLast(context, effectiveSender, "hoy", null, speakCallback)
-            return
-        }
-
-        val todayFiles = getOpusFilesForDayFromFirstToLast("hoy")
-        val filesToUse = if (todayFiles.isNotEmpty()) {
-            todayFiles
-        } else {
-            getRecentOpusFilesNewestFirst(limit = 20).reversed()
-        }
-
-        if (filesToUse.isEmpty()) {
-            if (!effectiveSender.isNullOrBlank()) {
-                startDayChatPlaybackFromFirstToLast(context, effectiveSender, "hoy", null, speakCallback)
+    private fun mapScreenItemsToEntries(screenItems: List<ScreenChatItem>, dayFilter: String): List<UnifiedChatEntry> {
+        return screenItems.map { item ->
+            if (!item.isAudio) {
+                alreadyReadTextsInCurrentDay.add(item.text)
+                UnifiedChatEntry(
+                    isAudio = false,
+                    spokenText = item.text,
+                    audioDurationMs = 0L,
+                    dayFilter = dayFilter
+                )
             } else {
-                speakCallback("No encontré audios de WhatsApp.", null)
+                UnifiedChatEntry(
+                    isAudio = true,
+                    spokenText = "",
+                    screenAudioOrderInDay = item.audioOrderInDay,
+                    audioDurationMs = item.audioDurationMs,
+                    dayFilter = dayFilter
+                )
             }
-            return
         }
-
-        activeQueue = filesToUse.map { f ->
-            UnifiedChatEntry(isAudio = true, spokenText = "", localAudioFile = f, dayFilter = "hoy")
-        }
-        activeQueueIndex = if (whichOffsetFromEnd == 1 && todayFiles.isNotEmpty()) {
-            0
-        } else {
-            (activeQueue.size - whichOffsetFromEnd).coerceIn(0, activeQueue.lastIndex)
-        }
-        playCurrentQueueEntryAndAutoAdvance(context, speakCallback)
     }
 
-    /**
-     * Ejecuta el elemento actual de la cola (texto o audio) y al terminar pasa automáticamente al siguiente.
-     * Al terminar el último elemento de un día anterior ("ayer", "viernes", etc.), pregunta si quiere continuar con los de hoy.
-     */
     private fun playCurrentQueueEntryAndAutoAdvance(
         context: Context,
         speakCallback: (String, (() -> Unit)?) -> Unit
@@ -444,7 +505,6 @@ object WhatsAppRepository {
         val entry = activeQueue[activeQueueIndex]
 
         if (!entry.isAudio) {
-            // Si antes había un audio en WhatsApp que quiso seguir reproduciendo solo, lo pausamos para leer el texto limpio
             JarvisAccessibilityService.instance?.pauseAnyPlayingVoiceNoteOnScreen()
 
             speakCallback(entry.spokenText) {
@@ -452,7 +512,7 @@ object WhatsAppRepository {
                     if (currentGen == autoAdvanceGeneration) {
                         advanceOrFinishDayQueue(context, speakCallback)
                     }
-                }, 450L)
+                }, 400L)
             }
         } else if (entry.localAudioFile != null && entry.localAudioFile.exists()) {
             playSingleAudioFile(entry.localAudioFile) { ok, errMsg ->
@@ -476,10 +536,9 @@ object WhatsAppRepository {
                             entry.screenAudioOrderInDay
                         )
                     }
-                }, 650L)
+                }, 600L)
             }
 
-            // Esperamos la duración real del audio (ej. 0:45 -> 45000ms) + verificación de reproducción activa
             scheduleScreenAudioCompletionMonitor(
                 context = context,
                 expectedGen = currentGen,
@@ -496,22 +555,36 @@ object WhatsAppRepository {
         if (activeQueueIndex + 1 <= activeQueue.lastIndex) {
             activeQueueIndex++
             playCurrentQueueEntryAndAutoAdvance(context, speakCallback)
-        } else {
-            // Llegó al final de los mensajes del día pedido
-            val finishedDay = activeQueueDayFilter
-            val contact = activeQueueContactName
-            if (finishedDay != "hoy" && !contact.isNullOrBlank() && onPastDayFinishedCallback != null) {
-                val cb = onPastDayFinishedCallback
-                onPastDayFinishedCallback = null
-                cb?.invoke(contact, finishedDay)
+            return
+        }
+
+        // Llegamos al último mensaje visible en pantalla: si el día es largo, probamos bajar con scroll para ver si siguen más mensajes de ese día
+        val service = JarvisAccessibilityService.instance
+        if (service != null && !activeQueueContactName.isNullOrBlank()) {
+            service.scrollDownForMoreItemsInSameDay(activeQueueDayFilter, alreadyReadTextsInCurrentDay) { moreScreenItems ->
+                if (moreScreenItems.isNotEmpty()) {
+                    activeQueue = mapScreenItemsToEntries(moreScreenItems, activeQueueDayFilter)
+                    activeQueueIndex = 0
+                    playCurrentQueueEntryAndAutoAdvance(context, speakCallback)
+                } else {
+                    notifyEndOfDayReached()
+                }
             }
+        } else {
+            notifyEndOfDayReached()
         }
     }
 
-    /**
-     * Espera a que termine el audio en pantalla respetando su duración real (ej. 0:45 -> 45000ms)
-     * y verificando AudioManager.isMusicActive + el botón de Pausa en pantalla para no cortarlo jamás a los 4 segundos.
-     */
+    private fun notifyEndOfDayReached() {
+        val finishedDay = activeQueueDayFilter
+        val contact = activeQueueContactName
+        if (finishedDay != "hoy" && !contact.isNullOrBlank() && onPastDayFinishedCallback != null) {
+            val cb = onPastDayFinishedCallback
+            onPastDayFinishedCallback = null
+            cb?.invoke(contact, finishedDay)
+        }
+    }
+
     private fun scheduleScreenAudioCompletionMonitor(
         context: Context,
         expectedGen: Int,
@@ -520,7 +593,6 @@ object WhatsAppRepository {
     ) {
         val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
         val startWait = System.currentTimeMillis()
-        // Nunca cortar antes de la duración leída de la burbuja (con un mínimo seguro de 6.5 segundos)
         val minWaitMs = expectedDurationMs.coerceAtLeast(6_500L)
         var consecutiveQuietChecks = 0
 
@@ -529,7 +601,6 @@ object WhatsAppRepository {
                 if (expectedGen != autoAdvanceGeneration) return
                 val elapsed = System.currentTimeMillis() - startWait
 
-                // Mientras no haya pasado la duración del audio, seguimos esperando sin interrumpir
                 if (elapsed < minWaitMs) {
                     mainHandler.postDelayed(this, 1000L)
                     return
@@ -542,7 +613,6 @@ object WhatsAppRepository {
                     false
                 }
 
-                // Si el siguiente elemento en la cola es un TEXTO, o si ya dejó de sonar el audio en WhatsApp, avanzamos
                 val nextEntryIsText = (activeQueueIndex + 1 <= activeQueue.lastIndex) && !activeQueue[activeQueueIndex + 1].isAudio
                 if (nextEntryIsText && elapsed >= expectedDurationMs + 600L) {
                     advanceOrFinishDayQueue(context, speakCallback)
@@ -565,11 +635,6 @@ object WhatsAppRepository {
         mainHandler.postDelayed(checkRunnable, 1500L)
     }
 
-    /**
-     * Comando por voz "Siguiente", "Anterior" o "Repetir":
-     * Salta inmediatamente al siguiente o anterior elemento (sea texto o audio).
-     * Si no hay más mensajes, responde siempre: "Ese fue el último mensaje."
-     */
     fun stepActiveQueue(
         context: Context,
         isNext: Boolean,
@@ -592,7 +657,20 @@ object WhatsAppRepository {
 
         if (isNext) {
             if (activeQueueIndex + 1 > activeQueue.lastIndex) {
-                speakCallback("Ese fue el último mensaje.", null)
+                val service = JarvisAccessibilityService.instance
+                if (service != null && !activeQueueContactName.isNullOrBlank()) {
+                    service.scrollDownForMoreItemsInSameDay(activeQueueDayFilter, alreadyReadTextsInCurrentDay) { moreScreenItems ->
+                        if (moreScreenItems.isNotEmpty()) {
+                            activeQueue = mapScreenItemsToEntries(moreScreenItems, activeQueueDayFilter)
+                            activeQueueIndex = 0
+                            playCurrentQueueEntryAndAutoAdvance(context, speakCallback)
+                        } else {
+                            speakCallback("Ese fue el último mensaje.", null)
+                        }
+                    }
+                } else {
+                    speakCallback("Ese fue el último mensaje.", null)
+                }
                 return
             }
             activeQueueIndex++
@@ -856,7 +934,7 @@ object WhatsAppRepository {
 
         val cleanPhone = formatPhoneForWhatsApp(contact.second)
         return try {
-            JarvisAccessibilityService.requestAutoClickSendInWhatsApp()
+            JarvisAccessibilityService.requestAutoClickSendInWhatsApp(contact.first)
 
             val uri = Uri.parse("https://api.whatsapp.com/send?phone=$cleanPhone&text=${Uri.encode(messageText)}")
             val intent = Intent(Intent.ACTION_VIEW, uri).apply {
@@ -871,8 +949,8 @@ object WhatsAppRepository {
     }
 
     /**
-     * Graba un audio real cuando el usuario dice "Contestale a X", "Respondele a X", "Enviale un audio a X" o "Mandale un audio a X"
-     * y lo envía automáticamente al detectar que terminó de hablar (usando umbral adaptativo para que el ruido ambiente no lo trabe).
+     * Graba y envía un AUDIO NATIVO directamente dentro del chat de WhatsApp (usando el candado manos libres del micrófono de WhatsApp),
+     * para que nunca aparezca como archivo externo ni pida "Aceptar".
      */
     fun recordAndSendRealVoiceNote(
         context: Context,
@@ -891,16 +969,51 @@ object WhatsAppRepository {
         val displayName = contact?.first ?: targetQuery
         lastOpenedContactName = displayName
 
-        onRecordingStarted()
+        val service = JarvisAccessibilityService.instance
+        if (service != null) {
+            // Abrimos el chat de la persona y apenas aparece el botón de micrófono nativo de WhatsApp,
+            // mantenemos presionado y deslizamos hacia arriba al candado manos libres.
+            JarvisAccessibilityService.requestWaitForNativeMicInOpenChat { micRect ->
+                onRecordingStarted()
+                mainHandler.postDelayed({
+                    service.lockNativeWhatsAppMicAndRecord(
+                        micRect = micRect,
+                        onRecordingLocked = {},
+                        onFinishedSending = { statusMsg ->
+                            onCompleted(statusMsg)
+                        }
+                    )
+                }, 260L)
+            }
 
-        // Iniciamos el grabador 260ms después del pitido para no grabar el pitido ni chocar con el micrófono
+            if (contact != null) {
+                openWhatsAppChatByPhone(context, contact.second)
+            } else {
+                JarvisAccessibilityService.requestSearchAndOpenChatInWhatsApp(targetQuery)
+                launchWhatsAppHome(context)
+            }
+            return
+        }
+
+        // Respaldo si el servicio de accesibilidad estuviera apagado
+        recordInternalFallbackVoiceNote(context, displayName, contact?.second, onRecordingStarted, onCompleted)
+    }
+
+    private fun recordInternalFallbackVoiceNote(
+        context: Context,
+        displayName: String,
+        contactPhone: String?,
+        onRecordingStarted: () -> Unit,
+        onCompleted: (String) -> Unit
+    ) {
+        onRecordingStarted()
         mainHandler.postDelayed({
             try {
                 val audioDir = File(context.cacheDir, "audios").apply { mkdirs() }
                 val audioFile = File(audioDir, "NotaDeVoz_${System.currentTimeMillis()}.m4a")
                 currentRecordingFile = audioFile
                 activeRecordingContactName = displayName
-                activeRecordingContactPhone = contact?.second
+                activeRecordingContactPhone = contactPhone
                 activeRecordingOnCompleted = onCompleted
 
                 val recorder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
@@ -942,7 +1055,6 @@ object WhatsAppRepository {
                             peakAmplitude = amplitude
                         }
 
-                        // Umbral adaptativo: ignora el ruido ambiente constante una vez que la persona habló
                         val speechThreshold = maxOf(1000, (peakAmplitude * 0.35).toInt())
                         if (amplitude > speechThreshold) {
                             lastSoundTime = now
@@ -960,7 +1072,7 @@ object WhatsAppRepository {
                             activeRecordingContactName = null
                             activeRecordingContactPhone = null
                             activeRecordingOnCompleted = null
-                            finishRecordingAndShareToWhatsApp(context, displayName, contact?.second, onCompleted)
+                            finishRecordingAndShareToWhatsApp(context, displayName, contactPhone, onCompleted)
                         } else {
                             mainHandler.postDelayed(this, 250L)
                         }
@@ -995,9 +1107,6 @@ object WhatsAppRepository {
                 file
             )
 
-            // Si tenemos el teléfono enviamos directo al JID y tocamos Enviar;
-            // si el contacto no estaba en la agenda del chip (o si WhatsApp abre el selector de contactos),
-            // el servicio de accesibilidad selecciona el nombre del contacto y toca Enviar automáticamente.
             JarvisAccessibilityService.requestAutoClickSendInWhatsApp(contactName)
 
             val sendIntent = Intent(Intent.ACTION_SEND).apply {
@@ -1030,10 +1139,6 @@ object WhatsAppRepository {
         mediaRecorder = null
     }
 
-    /**
-     * Búsqueda fonética inteligente de contactos en la agenda del teléfono:
-     * Entiende que "Dayana UNLa" == "Daiana UNLa", "Banesa" == "Vanesa", "Jise" == "Gise", etc.
-     */
     fun findContactByName(context: Context, queryName: String): Pair<String, String>? {
         val normQuery = normalizeText(queryName)
             .replace(Regex("^(el|la|los|las|a|de|del|con|chat de|chat con|hoy|ayer|persona)\\s+"), "")

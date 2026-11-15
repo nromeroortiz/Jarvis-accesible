@@ -10,6 +10,7 @@ import androidx.compose.runtime.setValue
 import com.jarvis.accesible.actions.SystemActionsController
 import com.jarvis.accesible.ai.AgentDecision
 import com.jarvis.accesible.ai.GeminiAgent
+import com.jarvis.accesible.services.JarvisAccessibilityService
 import com.jarvis.accesible.vision.BillRecognizer
 import com.jarvis.accesible.voice.SpeakerManager
 import com.jarvis.accesible.voice.SpeechInputManager
@@ -36,6 +37,8 @@ class JarvisCoordinator private constructor(private val context: Context) {
         private set
 
     private var pendingWhatsAppConfirmation: Pair<String, String>? = null
+    private var pendingTextDictationForContact: String? = null
+    private var pendingAudioOrTextChoiceForContact: String? = null
     private var pendingDayForContact: String? = null
     private var pendingContinueToTodayForContact: String? = null
 
@@ -55,19 +58,32 @@ class JarvisCoordinator private constructor(private val context: Context) {
         onListeningError = {
             isListeningUiState = false
             isProcessingUiState = false
-            if (pendingWhatsAppConfirmation != null) {
-                pendingWhatsAppConfirmation = null
-                speaker.speak("Cancelado.")
-            } else if (pendingContinueToTodayForContact != null) {
-                pendingContinueToTodayForContact = null
-            } else if (pendingDayForContact != null) {
-                val contact = pendingDayForContact
-                pendingDayForContact = null
-                if (!contact.isNullOrBlank()) {
-                    startUnifiedDayPlaybackWithFollowUp(contact, "hoy")
+            when {
+                pendingWhatsAppConfirmation != null -> {
+                    pendingWhatsAppConfirmation = null
+                    speaker.speak("Cancelado.")
                 }
-            } else {
-                speaker.speak("No te escuché.")
+                pendingTextDictationForContact != null -> {
+                    pendingTextDictationForContact = null
+                    speaker.speak("Cancelado.")
+                }
+                pendingAudioOrTextChoiceForContact != null -> {
+                    pendingAudioOrTextChoiceForContact = null
+                    speaker.speak("Cancelado.")
+                }
+                pendingContinueToTodayForContact != null -> {
+                    pendingContinueToTodayForContact = null
+                }
+                pendingDayForContact != null -> {
+                    val contact = pendingDayForContact
+                    pendingDayForContact = null
+                    if (!contact.isNullOrBlank()) {
+                        startUnifiedDayPlaybackWithFollowUp(contact, "hoy")
+                    }
+                }
+                else -> {
+                    speaker.speak("No te escuché.")
+                }
             }
         },
         onListeningStateChanged = { listening ->
@@ -79,21 +95,54 @@ class JarvisCoordinator private constructor(private val context: Context) {
     )
 
     fun triggerHandsFreeListening(greetBeforeListening: Boolean = false) {
+        // Pausamos cualquier lectura o audio en pantalla de WhatsApp para que el micrófono escuche limpio ("Siguiente", "Anterior", etc.)
         speaker.stopSpeaking()
         WhatsAppRepository.stopAudioPlayback()
+        JarvisAccessibilityService.instance?.pauseAnyPlayingVoiceNoteOnScreen()
 
         if (greetBeforeListening) {
             speaker.speak("Te escucho") {
-                speaker.beepAndVibrate(startListening = true)
-                mainHandler.postDelayed({
-                    speechInput.startCommandListening()
-                }, 350L)
+                openMicAfterBeep()
             }
         } else {
-            speaker.beepAndVibrate(startListening = true)
-            mainHandler.postDelayed({
-                speechInput.startCommandListening()
-            }, 350L)
+            openMicAfterBeep()
+        }
+    }
+
+    private fun openMicAfterBeep() {
+        speaker.beepAndVibrate(startListening = true)
+        mainHandler.postDelayed({
+            speechInput.startCommandListening()
+        }, 380L)
+    }
+
+    private fun startNativeAudioRecordingForContact(targetRaw: String) {
+        val contact = WhatsAppRepository.findContactByName(context, targetRaw)
+        val displayName = contact?.first ?: targetRaw
+        speechInput.stopAllListening()
+        speaker.speak("Grabando audio para $displayName. Hablá después del tono.") {
+            WhatsAppRepository.recordAndSendRealVoiceNote(
+                context = context,
+                recipientName = displayName,
+                onRecordingStarted = {
+                    speaker.beepAndVibrate(startListening = true)
+                },
+                onCompleted = { statusMsg ->
+                    speaker.beepAndVibrate(startListening = false)
+                    speaker.speak(statusMsg) {
+                        speechInput.syncWakeWordLoop()
+                    }
+                }
+            )
+        }
+    }
+
+    private fun askTextDictationForContact(targetRaw: String) {
+        val contact = WhatsAppRepository.findContactByName(context, targetRaw)
+        val displayName = contact?.first ?: targetRaw
+        pendingTextDictationForContact = displayName
+        speaker.speak("¿Qué mensaje le querés escribir a $displayName?") {
+            openMicAfterBeep()
         }
     }
 
@@ -105,10 +154,7 @@ class JarvisCoordinator private constructor(private val context: Context) {
             onPastDayFinished = { contactName, finishedDay ->
                 pendingContinueToTodayForContact = contactName
                 speaker.speak("Terminaron los mensajes de $finishedDay. ¿Querés seguir con los de hoy?") {
-                    speaker.beepAndVibrate(startListening = true)
-                    mainHandler.postDelayed({
-                        speechInput.startCommandListening()
-                    }, 350L)
+                    openMicAfterBeep()
                 }
             }
         ) { text, onDone ->
@@ -120,13 +166,13 @@ class JarvisCoordinator private constructor(private val context: Context) {
         isListeningUiState = false
         speaker.beepAndVibrate(startListening = false)
 
-        // 1. Confirmación pendiente de envío de mensaje escrito
-        val pending = pendingWhatsAppConfirmation
-        if (pending != null) {
+        // 1. Confirmación pendiente de envío de mensaje escrito ("¿Lo mando? Decí sí o no")
+        val pendingConfirm = pendingWhatsAppConfirmation
+        if (pendingConfirm != null) {
             pendingWhatsAppConfirmation = null
             val norm = WhatsAppRepository.normalizeText(userText)
             if (norm.contains("si") || norm.contains("mandalo") || norm.contains("enviar") || norm.contains("dale") || norm.contains("bueno") || norm.contains("correcto")) {
-                val result = WhatsAppRepository.sendTextMessage(context, pending.first, pending.second)
+                val result = WhatsAppRepository.sendTextMessage(context, pendingConfirm.first, pendingConfirm.second)
                 speaker.speak(result)
             } else {
                 speaker.speak("Cancelado.")
@@ -134,7 +180,46 @@ class JarvisCoordinator private constructor(private val context: Context) {
             return
         }
 
-        // 2. Confirmación pendiente al terminar un día anterior: "¿Querés seguir con los de hoy?"
+        // 2. Si le habíamos preguntado "¿Qué mensaje le querés escribir a X?"
+        val dictationContact = pendingTextDictationForContact
+        if (dictationContact != null) {
+            pendingTextDictationForContact = null
+            val cleanDictation = userText.trim()
+            if (cleanDictation.isEmpty() || WhatsAppRepository.normalizeText(cleanDictation) == "cancelar") {
+                speaker.speak("Cancelado.")
+            } else {
+                pendingWhatsAppConfirmation = Pair(dictationContact, cleanDictation)
+                speaker.speak("Mensaje para $dictationContact: \"$cleanDictation\". ¿Lo mando? Decí sí o no.") {
+                    openMicAfterBeep()
+                }
+            }
+            return
+        }
+
+        // 3. Si dijo "Contestale a X" y le preguntamos "¿Audio o mensaje de texto?"
+        val choiceContact = pendingAudioOrTextChoiceForContact
+        if (choiceContact != null) {
+            pendingAudioOrTextChoiceForContact = null
+            val norm = WhatsAppRepository.normalizeText(userText)
+            when {
+                norm.contains("audio") || norm.contains("voz") -> {
+                    startNativeAudioRecordingForContact(choiceContact)
+                }
+                norm.contains("mensaje") || norm.contains("texto") || norm.contains("escrito") || norm.contains("escribir") -> {
+                    askTextDictationForContact(choiceContact)
+                }
+                else -> {
+                    // Si directamente empezó a dictar lo que quería decirle, lo tomamos como mensaje escrito
+                    pendingWhatsAppConfirmation = Pair(choiceContact, userText.trim())
+                    speaker.speak("Mensaje para $choiceContact: \"${userText.trim()}\". ¿Lo mando? Decí sí o no.") {
+                        openMicAfterBeep()
+                    }
+                }
+            }
+            return
+        }
+
+        // 4. Confirmación pendiente al terminar un día anterior: "¿Querés seguir con los de hoy?"
         val continueContact = pendingContinueToTodayForContact
         if (continueContact != null) {
             pendingContinueToTodayForContact = null
@@ -150,10 +235,9 @@ class JarvisCoordinator private constructor(private val context: Context) {
                 speaker.speak("Listo.")
                 return
             }
-            // Si dijo otro comando distinto (ej. "contestale"), dejamos que siga abajo y lo ejecute
         }
 
-        // 3. Si había dicho "Abrí el chat de X" y Jarvis le preguntó "¿De qué día querés escuchar?"
+        // 5. Si había dicho "Abrí el chat de X" y Jarvis le preguntó "¿De qué día querés escuchar?"
         val contactWaitingDay = pendingDayForContact
         if (contactWaitingDay != null) {
             pendingDayForContact = null
@@ -198,33 +282,30 @@ class JarvisCoordinator private constructor(private val context: Context) {
                 }
 
                 is AgentDecision.CheckUnreadWhatsApp -> {
-                    val summary = WhatsAppRepository.getUnreadSummary(context)
-                    speaker.speak(summary)
+                    WhatsAppRepository.checkAndPlayUnreadImmediately(context) { text, onDone ->
+                        speaker.speak(text, onFinished = onDone)
+                    }
+                }
+
+                is AgentDecision.PlayLatestSingleVoiceNote -> {
+                    WhatsAppRepository.playLatestSingleAudioOnly(
+                        context = context,
+                        senderHint = decision.senderName
+                    ) { text, onDone ->
+                        speaker.speak(text, onFinished = onDone)
+                    }
                 }
 
                 is AgentDecision.OpenWhatsAppChatAndAskDay -> {
                     val displayName = WhatsAppRepository.openContactChatOnly(context, decision.senderName)
                     pendingDayForContact = displayName
                     speaker.speak("Chat de $displayName abierto. ¿De qué día querés escuchar?") {
-                        speaker.beepAndVibrate(startListening = true)
-                        mainHandler.postDelayed({
-                            speechInput.startCommandListening()
-                        }, 350L)
+                        openMicAfterBeep()
                     }
                 }
 
                 is AgentDecision.StartUnifiedDayChatPlayback -> {
                     startUnifiedDayPlaybackWithFollowUp(decision.senderName, decision.dayFilter)
-                }
-
-                is AgentDecision.PlayWhatsAppVoiceNote -> {
-                    WhatsAppRepository.playSingleRequestedVoiceNote(
-                        context = context,
-                        senderHint = decision.senderName,
-                        whichOffsetFromEnd = decision.whichOffset
-                    ) { text, onDone ->
-                        speaker.speak(text, onFinished = onDone)
-                    }
                 }
 
                 is AgentDecision.NavigateQueue -> {
@@ -242,14 +323,36 @@ class JarvisCoordinator private constructor(private val context: Context) {
                     if (target.isBlank() || decision.messageText.isBlank()) {
                         speaker.speak("Decime para quién es y el mensaje.")
                     } else {
-                        pendingWhatsAppConfirmation = Pair(target, decision.messageText)
+                        val contact = WhatsAppRepository.findContactByName(context, target)
+                        val displayName = contact?.first ?: target
+                        pendingWhatsAppConfirmation = Pair(displayName, decision.messageText)
                         speaker.speak(
-                            "Mensaje para $target: \"${decision.messageText}\". ¿Lo mando? Decí sí o no."
+                            "Mensaje para $displayName: \"${decision.messageText}\". ¿Lo mando? Decí sí o no."
                         ) {
-                            speaker.beepAndVibrate(startListening = true)
-                            mainHandler.postDelayed({
-                                speechInput.startCommandListening()
-                            }, 350L)
+                            openMicAfterBeep()
+                        }
+                    }
+                }
+
+                is AgentDecision.AskWhatsAppTextDictation -> {
+                    val target = decision.recipientName.ifBlank { WhatsAppRepository.lastOpenedContactName.orEmpty() }
+                    if (target.isBlank()) {
+                        speaker.speak("Decime para quién es el mensaje.")
+                    } else {
+                        askTextDictationForContact(target)
+                    }
+                }
+
+                is AgentDecision.AskReplyAudioOrTextChoice -> {
+                    val target = decision.recipientName.ifBlank { WhatsAppRepository.lastOpenedContactName.orEmpty() }
+                    if (target.isBlank()) {
+                        speaker.speak("Decime a quién le querés contestar.")
+                    } else {
+                        val contact = WhatsAppRepository.findContactByName(context, target)
+                        val displayName = contact?.first ?: target
+                        pendingAudioOrTextChoiceForContact = displayName
+                        speaker.speak("¿Le querés mandar audio o mensaje de texto a $displayName?") {
+                            openMicAfterBeep()
                         }
                     }
                 }
@@ -259,24 +362,7 @@ class JarvisCoordinator private constructor(private val context: Context) {
                     if (target.isBlank()) {
                         speaker.speak("Decime para quién es el audio.")
                     } else {
-                        val contact = WhatsAppRepository.findContactByName(context, target)
-                        val displayName = contact?.first ?: target
-                        speechInput.stopAllListening()
-                        speaker.speak("Grabando audio para $displayName. Hablá después del tono.") {
-                            WhatsAppRepository.recordAndSendRealVoiceNote(
-                                context = context,
-                                recipientName = displayName,
-                                onRecordingStarted = {
-                                    speaker.beepAndVibrate(startListening = true)
-                                },
-                                onCompleted = { statusMsg ->
-                                    speaker.beepAndVibrate(startListening = false)
-                                    speaker.speak(statusMsg) {
-                                        speechInput.syncWakeWordLoop()
-                                    }
-                                }
-                            )
-                        }
+                        startNativeAudioRecordingForContact(target)
                     }
                 }
 
