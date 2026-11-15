@@ -426,6 +426,14 @@ class JarvisCoordinator private constructor(private val context: Context) {
                     val msg = SystemActionsController.setOrCheckFlashlight(context, decision.turnOn)
                     speaker.speak(msg)
                 }
+
+                is AgentDecision.UpdateWhatsApp -> {
+                    speaker.speak("Abriendo Play Store para actualizar WhatsApp.") {
+                        SystemActionsController.openWhatsAppInPlayStore(context) { statusMsg ->
+                            speaker.speak(statusMsg)
+                        }
+                    }
+                }
             }
         }
     }

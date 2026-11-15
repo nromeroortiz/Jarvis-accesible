@@ -54,6 +54,29 @@ object SystemActionsController {
     @Volatile
     private var isTorchCallbackRegistered = false
 
+    fun openWhatsAppInPlayStore(context: Context, onStatusSpoken: (String) -> Unit) {
+        JarvisAccessibilityService.requestAutoUpdateWhatsApp(onStatusSpoken)
+        try {
+            val marketIntent = Intent(Intent.ACTION_VIEW, Uri.parse("market://details?id=com.whatsapp")).apply {
+                setPackage("com.android.vending")
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
+            }
+            context.startActivity(marketIntent)
+        } catch (_: Exception) {
+            try {
+                val webIntent = Intent(
+                    Intent.ACTION_VIEW,
+                    Uri.parse("https://play.google.com/store/apps/details?id=com.whatsapp")
+                ).apply {
+                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                }
+                context.startActivity(webIntent)
+            } catch (_: Exception) {
+                onStatusSpoken("No pude abrir la Play Store.")
+            }
+        }
+    }
+
     fun setOrCheckFlashlight(context: Context, turnOn: Boolean?): String {
         return try {
             val cameraManager = context.getSystemService(Context.CAMERA_SERVICE) as CameraManager

@@ -17,6 +17,7 @@ import android.view.KeyEvent
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
 import androidx.core.content.ContextCompat
+import com.jarvis.accesible.actions.SystemActionsController
 import com.jarvis.accesible.core.AppPrefs
 import com.jarvis.accesible.core.JarvisCoordinator
 import com.jarvis.accesible.whatsapp.WhatsAppRepository
@@ -101,6 +102,24 @@ class JarvisAccessibilityService : AccessibilityService() {
         val now = System.currentTimeMillis()
 
         if (pkg.startsWith("com.whatsapp")) {
+            val rootForOutdated = rootInActiveWindow
+            if (rootForOutdated != null && now > lastOutdatedWhatsAppTriggerTime + 45_000L) {
+                if (detectWhatsAppOutdatedScreen(rootForOutdated)) {
+                    lastOutdatedWhatsAppTriggerTime = now
+                    val coordinator = JarvisCoordinator.getInstance(applicationContext)
+                    coordinator.speaker.speak("WhatsApp pide actualizarse. Abriendo Play Store para actualizarlo solo.") {
+                        SystemActionsController.openWhatsAppInPlayStore(applicationContext) { statusMsg ->
+                            coordinator.speaker.speak(statusMsg)
+                        }
+                    }
+                    clickByContentDescriptionOrText(
+                        rootForOutdated,
+                        listOf("actualizar", "actualizar whatsapp", "descargar", "ir a google play", "update")
+                    )
+                    return
+                }
+            }
+
             // A) Clic automático en "Aceptar / OK" y luego en "Enviar" al mandar mensaje o audio
             if (now < autoClickSendUntilTimestamp) {
                 val root = rootInActiveWindow ?: return
@@ -180,12 +199,78 @@ class JarvisAccessibilityService : AccessibilityService() {
             }
         }
 
+        // Automatización en Google Play Store para actualizar WhatsApp
+        if (pkg == "com.android.vending" && now < autoUpdateWhatsAppUntilTimestamp) {
+            val root = rootInActiveWindow ?: return
+            handlePlayStoreWhatsAppUpdate(root, now)
+            return
+        }
+
         // Automatización en YouTube
         if (pkg.contains("youtube") && now < autoPlayYouTubeUntilTimestamp && now > lastYouTubeClickTime + 3000L) {
             val root = rootInActiveWindow ?: return
             if (findAndClickFirstYouTubeItem(root)) {
                 lastYouTubeClickTime = now
                 autoPlayYouTubeUntilTimestamp = 0L
+            }
+        }
+    }
+
+    private fun detectWhatsAppOutdatedScreen(node: AccessibilityNodeInfo?): Boolean {
+        if (node == null) return false
+        val allTexts = mutableListOf<String>()
+        collectAllVisibleTexts(node, allTexts, maxNodes = 80)
+        val joined = normalize(allTexts.joinToString(" "))
+        val hasExpiredText = joined.contains("esta version de whatsapp caduco") ||
+            joined.contains("whatsapp caduco") ||
+            joined.contains("version de whatsapp vencio") ||
+            joined.contains("actualiza whatsapp para seguir") ||
+            joined.contains("actualizar whatsapp") ||
+            joined.contains("descarga la version mas reciente de whatsapp") ||
+            joined.contains("this version of whatsapp has expired")
+        return hasExpiredText
+    }
+
+    private fun collectAllVisibleTexts(
+        node: AccessibilityNodeInfo?,
+        out: MutableList<String>,
+        maxNodes: Int
+    ) {
+        if (node == null || out.size >= maxNodes) return
+        val txt = node.text?.toString()?.trim().orEmpty()
+        val desc = node.contentDescription?.toString()?.trim().orEmpty()
+        if (txt.isNotEmpty()) out.add(txt)
+        if (desc.isNotEmpty() && desc != txt) out.add(desc)
+        for (i in 0 until node.childCount) {
+            val child = node.getChild(i) ?: continue
+            collectAllVisibleTexts(child, out, maxNodes)
+        }
+    }
+
+    private fun handlePlayStoreWhatsAppUpdate(root: AccessibilityNodeInfo, now: Long) {
+        // 1. Si está el botón "Actualizar" / "Update", lo tocamos de inmediato
+        if (clickByContentDescriptionOrText(root, listOf("actualizar", "update"))) {
+            autoUpdateWhatsAppUntilTimestamp = 0L
+            val cb = onWhatsAppUpdateStatusCallback
+            onWhatsAppUpdateStatusCallback = null
+            cb?.invoke("Actualizando WhatsApp. Esperá un minutito a que termine de descargarse e instalarse solo.")
+            return
+        }
+
+        // 2. Si ya pasaron al menos 2.2 segundos desde que se abrió Play Store y vemos "Abrir" y "Desinstalar" (sin "Actualizar"), ya está al día
+        if (now - autoUpdateWhatsAppStartedAt >= 2_200L) {
+            val texts = mutableListOf<String>()
+            collectAllVisibleTexts(root, texts, maxNodes = 90)
+            val normTexts = texts.map { normalize(it) }
+            val hasOpenBtn = normTexts.any { it == "abrir" || it == "open" }
+            val hasUninstallBtn = normTexts.any { it == "desinstalar" || it == "uninstall" }
+            val hasUpdateBtn = normTexts.any { it == "actualizar" || it == "update" }
+
+            if (hasOpenBtn && hasUninstallBtn && !hasUpdateBtn) {
+                autoUpdateWhatsAppUntilTimestamp = 0L
+                val cb = onWhatsAppUpdateStatusCallback
+                onWhatsAppUpdateStatusCallback = null
+                cb?.invoke("WhatsApp ya está actualizado.")
             }
         }
     }
@@ -1329,6 +1414,25 @@ class JarvisAccessibilityService : AccessibilityService() {
 
         @Volatile
         private var lastYouTubeClickTime: Long = 0L
+
+        @Volatile
+        private var autoUpdateWhatsAppUntilTimestamp: Long = 0L
+
+        @Volatile
+        private var autoUpdateWhatsAppStartedAt: Long = 0L
+
+        @Volatile
+        private var onWhatsAppUpdateStatusCallback: ((String) -> Unit)? = null
+
+        @Volatile
+        private var lastOutdatedWhatsAppTriggerTime: Long = 0L
+
+        fun requestAutoUpdateWhatsApp(onStatus: (String) -> Unit) {
+            val now = System.currentTimeMillis()
+            autoUpdateWhatsAppStartedAt = now
+            autoUpdateWhatsAppUntilTimestamp = now + 18_000L
+            onWhatsAppUpdateStatusCallback = onStatus
+        }
 
         fun requestAutoClickSendInWhatsApp(recipientName: String? = null) {
             pendingSendRecipientName = recipientName?.trim()?.takeIf { it.isNotEmpty() }

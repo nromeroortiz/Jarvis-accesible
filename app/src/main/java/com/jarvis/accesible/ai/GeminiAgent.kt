@@ -45,6 +45,7 @@ sealed class AgentDecision {
     data class ToggleWakeWordListening(val enable: Boolean) : AgentDecision()
     data class IdentifyBanknote(val dummy: Boolean = true) : AgentDecision()
     data class ControlFlashlight(val turnOn: Boolean?) : AgentDecision()
+    data class UpdateWhatsApp(val dummy: Boolean = true) : AgentDecision()
 }
 
 class GeminiAgent(private val context: Context) {
@@ -204,9 +205,16 @@ class GeminiAgent(private val context: Context) {
         ) {
             return AgentDecision.SpeakOnly(
                 "Puedo leer tus mensajes nuevos diciendo tengo mensajes, leer el historial de cualquier día diciendo leeme los mensajes de ayer o del viernes, " +
-                    "enviar audios o mensajes escritos por WhatsApp, prender o apagar la linterna, llamar en altavoz, decirte la hora, la batería, el clima, " +
+                    "enviar audios o mensajes escritos por WhatsApp, actualizar WhatsApp en la Play Store, prender o apagar la linterna, llamar en altavoz, decirte la hora, la batería, el clima, " +
                     "reconocer billetes con la cámara, poner cualquier canción en YouTube y explicarte recetas paso a paso."
             )
+        }
+
+        // 0A. Actualizar WhatsApp ("actualizá WhatsApp", "actualizar WhatsApp", "descargá la actualización de WhatsApp")
+        if ((norm.contains("actualiza") || norm.contains("actualizar") || norm.contains("actualizame") || norm.contains("actualizacion")) &&
+            (norm.contains("whatsapp") || norm.contains("wasap") || norm.contains("wsp") || norm.contains("aplicacion"))
+        ) {
+            return AgentDecision.UpdateWhatsApp()
         }
 
         // 0B. Linterna ("prende la linterna", "apaga la linterna" y todas sus variantes)

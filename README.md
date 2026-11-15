@@ -26,6 +26,8 @@
 - **Envío de mensajes escritos (`"Enviale un mensaje a [Contacto]"` o `"Contestale a [Contacto]"`):**
   - Diferencia automáticamente entre enviar un **audio** y enviar un **mensaje de texto**.
   - Si se pide *"Contestale a [Contacto]"*, pregunta si desea responder por **audio o mensaje de texto**, confirma el contenido dictado y lo envía automáticamente.
+- **Actualización automática de WhatsApp en Google Play Store (`"Actualizá WhatsApp"`):**
+  - Al decir **"Actualizá WhatsApp"** (o de forma 100% automática si al abrir WhatsApp aparece el cartel de bloqueo *"Esta versión de WhatsApp caducó"*), abre la ficha oficial de WhatsApp en Google Play Store, busca el botón **"Actualizar"** y lo presiona solo, avisando por voz cuando comienza la descarga o si ya se encuentra en la última versión.
 
 ### 3. Música y Videos en YouTube sin pasos intermedios
 - Al pedir *"Reproducí [canción o artista]"* o *"Poné [canción]"* (sin necesidad de aclarar *"en YouTube"*), busca el primer resultado real de video y comienza la reproducción automáticamente.
