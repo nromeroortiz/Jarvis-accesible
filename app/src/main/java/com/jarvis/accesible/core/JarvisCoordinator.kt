@@ -20,8 +20,8 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
 
 /**
- * Coordinador principal que une la voz, el botón físico, la IA de Gemini y las acciones sobre WhatsApp/Android.
- * Incluye flujo de confirmación por voz antes de enviar un mensaje de texto por WhatsApp.
+ * Coordinador principal que une la voz, el botón físico, la IA y las acciones sobre WhatsApp/Android.
+ * Todas las respuestas fueron optimizadas para ser cortas, directas y sin rodeos.
  */
 class JarvisCoordinator private constructor(private val context: Context) {
 
@@ -36,7 +36,7 @@ class JarvisCoordinator private constructor(private val context: Context) {
     var isProcessingUiState by mutableStateOf(false)
         private set
 
-    // Si hay un mensaje de texto de WhatsApp esperando que el tío diga "Sí, mandalo" o "Cancelar"
+    // Si hay un mensaje de texto de WhatsApp esperando que el tío diga "Sí" o "No"
     private var pendingWhatsAppConfirmation: Pair<String, String>? = null
 
     val speechInput = SpeechInputManager(
@@ -57,9 +57,9 @@ class JarvisCoordinator private constructor(private val context: Context) {
             isProcessingUiState = false
             if (pendingWhatsAppConfirmation != null) {
                 pendingWhatsAppConfirmation = null
-                speaker.speak("No te escuché, cancelé el envío del mensaje.")
+                speaker.speak("Cancelado.")
             } else {
-                speaker.speak("No llegué a escucharte. Tocá el botón o llamame cuando quieras.")
+                speaker.speak("No te escuché.")
             }
         },
         onListeningStateChanged = { listening ->
@@ -67,27 +67,19 @@ class JarvisCoordinator private constructor(private val context: Context) {
         }
     )
 
-    /**
-     * Se invoca cuando el tío toca el botón físico de Subir Volumen, toca el botón gigante en pantalla
-     * o dice la palabra de activación "Hola Jarvis".
-     * NO requiere mantener apretado ningún botón mientras habla.
-     */
     fun triggerHandsFreeListening(greetBeforeListening: Boolean = false) {
-        // Si Jarvis estaba hablando o había un audio de WhatsApp sonando, lo callamos primero
         speaker.stopSpeaking()
         WhatsAppRepository.stopAudioPlayback()
 
         if (greetBeforeListening) {
-            speaker.speak("Sí, te escucho") {
+            speaker.speak("Te escucho") {
                 speaker.beepAndVibrate(startListening = true)
-                // Esperamos 350ms tras el pitido para que el canal de audio quede libre antes de abrir el micrófono
                 mainHandler.postDelayed({
                     speechInput.startCommandListening()
                 }, 350L)
             }
         } else {
             speaker.beepAndVibrate(startListening = true)
-            // Esperamos 350ms tras el pitido para que el micrófono nunca choque con el sonido del beep
             mainHandler.postDelayed({
                 speechInput.startCommandListening()
             }, 350L)
@@ -98,7 +90,6 @@ class JarvisCoordinator private constructor(private val context: Context) {
         isListeningUiState = false
         speaker.beepAndVibrate(startListening = false)
 
-        // ¿Estábamos esperando confirmación para enviar un mensaje de texto por WhatsApp?
         val pending = pendingWhatsAppConfirmation
         if (pending != null) {
             pendingWhatsAppConfirmation = null
@@ -107,7 +98,7 @@ class JarvisCoordinator private constructor(private val context: Context) {
                 val result = WhatsAppRepository.sendTextMessage(context, pending.first, pending.second)
                 speaker.speak(result)
             } else {
-                speaker.speak("Entendido, cancelé el mensaje para ${pending.first}.")
+                speaker.speak("Cancelado.")
             }
             return
         }
@@ -125,34 +116,60 @@ class JarvisCoordinator private constructor(private val context: Context) {
                     speaker.speak(decision.message)
                 }
 
+                is AgentDecision.CheckTimeOnly -> {
+                    speaker.speak(SystemActionsController.getCurrentTimeOnly())
+                }
+
+                is AgentDecision.CheckDateOnly -> {
+                    speaker.speak(SystemActionsController.getCurrentDateOnly())
+                }
+
+                is AgentDecision.CheckBatteryOnly -> {
+                    speaker.speak(SystemActionsController.getBatteryOnly(context))
+                }
+
+                is AgentDecision.CheckConnectionOnly -> {
+                    speaker.speak(SystemActionsController.getConnectionOnly(context))
+                }
+
+                is AgentDecision.CheckWeather -> {
+                    val weatherMsg = SystemActionsController.getWeatherReport(context, decision.includeForecast)
+                    speaker.speak(weatherMsg)
+                }
+
                 is AgentDecision.CheckUnreadWhatsApp -> {
                     val summary = WhatsAppRepository.getUnreadSummary()
                     speaker.speak(summary)
                 }
 
                 is AgentDecision.ReadWhatsAppFromSender -> {
-                    val report = WhatsAppRepository.getMessagesFromSender(decision.senderName)
+                    val report = WhatsAppRepository.getMessagesFromSender(context, decision.senderName)
                     speaker.speak(report)
                 }
 
-                is AgentDecision.PlayLatestWhatsAppVoiceNote -> {
-                    speaker.speak("Reproduciendo el audio de WhatsApp.") {
-                        WhatsAppRepository.playLatestWhatsAppVoiceNote(
-                            context = context,
-                            senderHint = decision.senderName
-                        ) { _, finishMsg ->
-                            speaker.speak("$finishMsg ¿Querés responderle con un audio o por texto?")
+                is AgentDecision.PlayWhatsAppVoiceNote -> {
+                    // Reproducimos de inmediato sin discurso previo largo para que no demore
+                    WhatsAppRepository.playWhatsAppVoiceNoteFlexible(
+                        context = context,
+                        senderHint = decision.senderName,
+                        whichOffset = decision.whichOffset,
+                        stepBackward = decision.stepBackward,
+                        repeatCurrent = decision.repeatCurrent,
+                        forceOpenChat = decision.forceOpenChat
+                    ) { ok, finishMsg ->
+                        if (!ok) {
+                            speaker.speak(finishMsg)
                         }
                     }
                 }
 
                 is AgentDecision.ProposeWhatsAppTextMessage -> {
                     if (decision.recipientName.isBlank() || decision.messageText.isBlank()) {
-                        speaker.speak("Decime a quién querés escribirle y qué mensaje le ponemos.")
+                        speaker.speak("Decime para quién es y el mensaje.")
                     } else {
                         pendingWhatsAppConfirmation = Pair(decision.recipientName, decision.messageText)
                         speaker.speak(
-                            "Le voy a mandar un WhatsApp a ${decision.recipientName} que dice: \"${decision.messageText}\". ¿Se lo mando? Decí sí o cancelar."
+                            "Mensaje para ${decision.recipientName}: \"${decision.messageText}\". ¿Lo mando? Decí sí o no."
                         ) {
                             speaker.beepAndVibrate(startListening = true)
                             mainHandler.postDelayed({
@@ -164,11 +181,9 @@ class JarvisCoordinator private constructor(private val context: Context) {
 
                 is AgentDecision.StartWhatsAppVoiceNoteRecording -> {
                     if (decision.recipientName.isBlank()) {
-                        speaker.speak("Decime a qué contacto le querés grabar el audio de WhatsApp.")
+                        speaker.speak("Decime para quién es el audio.")
                     } else {
-                        speaker.speak(
-                            "Después del pitido, hablá para grabar tu audio para ${decision.recipientName}. Cuando termines de hablar, hacé silencio dos segundos y se enviará solo."
-                        ) {
+                        speaker.speak("Hablá después del tono.") {
                             WhatsAppRepository.recordAndSendRealVoiceNote(
                                 context = context,
                                 recipientName = decision.recipientName,
@@ -195,7 +210,7 @@ class JarvisCoordinator private constructor(private val context: Context) {
                 }
 
                 is AgentDecision.PlayYouTube -> {
-                    speaker.speak("Buscando y reproduciendo ${decision.searchQuery} en YouTube.") {
+                    speaker.speak("Poniendo ${decision.searchQuery}.") {
                         scope.launch {
                             SystemActionsController.playOnYouTubeDirectly(context, decision.searchQuery)
                         }
@@ -217,24 +232,15 @@ class JarvisCoordinator private constructor(private val context: Context) {
                     speaker.speak(msg)
                 }
 
-                is AgentDecision.CheckPhoneStatus -> {
-                    val msg = SystemActionsController.getPhoneStatusReport(context)
-                    speaker.speak(msg)
-                }
-
                 is AgentDecision.ToggleWakeWordListening -> {
                     AppPrefs.setWakeWordEnabled(context, decision.enable)
                     speechInput.syncWakeWordLoop()
-                    val msg = if (decision.enable) {
-                        "Activé la escucha continua por voz. Ahora podés llamarme diciendo Hola Jarvis."
-                    } else {
-                        "Desactivé la escucha continua por voz para ahorrar batería. Podés activarme tocando dos veces el botón de Subir Volumen."
-                    }
+                    val msg = if (decision.enable) "Escucha por voz activada." else "Escucha por voz desactivada."
                     speaker.speak(msg)
                 }
 
                 is AgentDecision.IdentifyBanknote -> {
-                    speaker.speak("Mantené el billete frente a la cámara de atrás.") {
+                    speaker.speak("Apuntá al billete.") {
                         scope.launch {
                             val result = BillRecognizer.scanAndIdentifyBanknote(
                                 context = context,

@@ -1,6 +1,7 @@
 package com.jarvis.accesible.services
 
 import android.accessibilityservice.AccessibilityService
+import android.graphics.Rect
 import android.os.Handler
 import android.os.Looper
 import android.view.KeyEvent
@@ -14,8 +15,10 @@ import com.jarvis.accesible.core.JarvisCoordinator
  * 1. Arranca solo al encender el teléfono sin que el tío tenga que abrir ninguna aplicación.
  * 2. Detecta cuando el tío toca 2 veces seguidas el botón físico de Subir Volumen (y suelta el botón),
  *    activando el micrófono manos libres sin tener que mantener apretado el botón mientras habla.
- * 3. Toca automáticamente el botón "Enviar" en WhatsApp cuando se envía un audio grabado o un mensaje nuevo,
- *    para que el proceso nunca se corte esperando un toque en la pantalla.
+ * 3. En WhatsApp:
+ *    - Toca automáticamente el botón "Enviar" cuando se envía un audio grabado o un mensaje de texto.
+ *    - En el chat de un contacto, busca todos los audios en pantalla y toca "Reproducir" en el que pidió el tío
+ *      (el último de abajo de todo, el penúltimo/anterior, el antepenúltimo, etc.).
  */
 class JarvisAccessibilityService : AccessibilityService() {
 
@@ -25,7 +28,6 @@ class JarvisAccessibilityService : AccessibilityService() {
     override fun onServiceConnected() {
         super.onServiceConnected()
         instance = this
-        // Asegura que el coordinador y el servicio en segundo plano estén activos
         JarvisForegroundService.startServiceIfPossible(applicationContext)
         JarvisCoordinator.getInstance(applicationContext).speechInput.syncWakeWordLoop()
     }
@@ -34,15 +36,12 @@ class JarvisAccessibilityService : AccessibilityService() {
         if (event == null) return false
         if (!AppPrefs.isVolumeButtonTriggerEnabled(applicationContext)) return false
 
-        // Doble toque en el botón físico de Subir Volumen activa a Jarvis en modo manos libres:
-        // Así un toque simple sigue sirviendo para subir el volumen normalmente,
-        // y dos toques seguidos activan al asistente sin tener que mantener apretado el botón mientras habla.
         if (event.keyCode == KeyEvent.KEYCODE_VOLUME_UP && event.action == KeyEvent.ACTION_DOWN) {
             val now = System.currentTimeMillis()
             if (now - lastVolumeUpDownTime in 80L..650L) {
                 lastVolumeUpDownTime = 0L
                 JarvisCoordinator.getInstance(applicationContext).triggerHandsFreeListening(greetBeforeListening = false)
-                return true // Consumimos el segundo toque para que empiece a escuchar limpio
+                return true
             }
             lastVolumeUpDownTime = now
         }
@@ -54,26 +53,31 @@ class JarvisAccessibilityService : AccessibilityService() {
         val pkg = event.packageName?.toString() ?: return
         val now = System.currentTimeMillis()
 
-        // 1. Automatización en WhatsApp: clic automático en "Enviar" cuando se comparte un audio grabado o un texto
+        // 1. Automatización en WhatsApp
         if (pkg.startsWith("com.whatsapp")) {
             if (now < autoClickSendUntilTimestamp) {
                 val root = rootInActiveWindow ?: return
                 if (findAndClickSendButtonInWhatsApp(root)) {
                     autoClickSendUntilTimestamp = 0L
-                    // Volvemos atrás suavemente después de 1.5s para que el teléfono quede limpio
                     mainHandler.postDelayed({
                         performGlobalAction(GLOBAL_ACTION_BACK)
                     }, 1500L)
                 }
             } else if (now < autoPlayVoiceNoteUntilTimestamp) {
                 val root = rootInActiveWindow ?: return
-                if (findAndClickPlayVoiceNoteInWhatsApp(root)) {
-                    autoPlayVoiceNoteUntilTimestamp = 0L
-                }
+                // Esperamos 450ms a que WhatsApp termine de dibujar la lista de mensajes del chat
+                mainHandler.postDelayed({
+                    val freshRoot = rootInActiveWindow ?: root
+                    if (now < autoPlayVoiceNoteUntilTimestamp &&
+                        findAndClickTargetVoiceNoteInWhatsApp(freshRoot, targetVoiceNoteOffsetFromBottom)
+                    ) {
+                        autoPlayVoiceNoteUntilTimestamp = 0L
+                    }
+                }, 450L)
             }
         }
 
-        // 2. Automatización en YouTube: si abrió resultados de búsqueda o cartel de anuncio, toca el primer video / Saltar anuncio
+        // 2. Automatización en YouTube: toca el primer video o Salta anuncio
         if (pkg.contains("youtube") && now < autoPlayYouTubeUntilTimestamp) {
             val root = rootInActiveWindow ?: return
             if (findAndClickFirstYouTubeItem(root)) {
@@ -83,7 +87,6 @@ class JarvisAccessibilityService : AccessibilityService() {
     }
 
     private fun findAndClickSendButtonInWhatsApp(root: AccessibilityNodeInfo): Boolean {
-        // Búsqueda por IDs oficiales de botón Enviar en WhatsApp
         val sendIds = listOf(
             "com.whatsapp:id/send",
             "com.whatsapp:id/send_container",
@@ -97,17 +100,62 @@ class JarvisAccessibilityService : AccessibilityService() {
                 }
             }
         }
-
-        // Búsqueda por descripción de accesibilidad ("Enviar" / "Send")
         return clickByContentDescriptionOrText(root, listOf("enviar", "send"))
     }
 
-    private fun findAndClickPlayVoiceNoteInWhatsApp(root: AccessibilityNodeInfo): Boolean {
-        return clickByContentDescriptionOrText(root, listOf("reproducir", "play"))
+    /**
+     * Busca todos los botones "Reproducir" de notas de voz visibles en el chat abierto,
+     * los ordena de arriba hacia abajo en la pantalla y hace clic en el que pidió el usuario:
+     * offsetFromBottom = 1 -> el último audio (el de más abajo)
+     * offsetFromBottom = 2 -> el penúltimo / anterior audio
+     * offsetFromBottom = 3 -> el antepenúltimo audio (o para escuchar los últimos 3 seguidos)
+     */
+    private fun findAndClickTargetVoiceNoteInWhatsApp(
+        root: AccessibilityNodeInfo,
+        offsetFromBottom: Int
+    ): Boolean {
+        val playNodes = mutableListOf<Pair<Int, AccessibilityNodeInfo>>()
+        collectPlayVoiceNoteNodes(root, playNodes)
+
+        if (playNodes.isEmpty()) return false
+
+        // Ordenamos verticalmente por posición en pantalla (de más arriba a más abajo)
+        val sortedByTop = playNodes.sortedBy { it.first }.map { it.second }
+        val targetIndex = (sortedByTop.size - offsetFromBottom.coerceAtLeast(1)).coerceIn(0, sortedByTop.lastIndex)
+        return clickNodeOrParent(sortedByTop[targetIndex])
+    }
+
+    private fun collectPlayVoiceNoteNodes(
+        node: AccessibilityNodeInfo?,
+        outList: MutableList<Pair<Int, AccessibilityNodeInfo>>
+    ) {
+        if (node == null) return
+        val desc = node.contentDescription?.toString()?.lowercase()?.trim() ?: ""
+        val text = node.text?.toString()?.lowercase()?.trim() ?: ""
+        val viewId = node.viewIdResourceName?.lowercase() ?: ""
+
+        val isPlayBtn = desc == "reproducir" ||
+            desc.startsWith("reproducir ") ||
+            desc == "play" ||
+            text == "reproducir" ||
+            viewId.endsWith(":id/control_btn") ||
+            viewId.endsWith(":id/audio_play_pause_btn")
+
+        if (isPlayBtn) {
+            val rect = Rect()
+            node.getBoundsInScreen(rect)
+            if (rect.top > 100 && rect.bottom > rect.top) {
+                outList.add(Pair(rect.top, node))
+            }
+        }
+
+        for (i in 0 until node.childCount) {
+            val child = node.getChild(i) ?: continue
+            collectPlayVoiceNoteNodes(child, outList)
+        }
     }
 
     private fun findAndClickFirstYouTubeItem(root: AccessibilityNodeInfo): Boolean {
-        // Primero si hay botón "Saltar anuncio" / "Omitir anuncio", lo toca
         if (clickByContentDescriptionOrText(root, listOf("saltar anuncio", "omitir anuncio", "skip ad"))) {
             return true
         }
@@ -167,13 +215,17 @@ class JarvisAccessibilityService : AccessibilityService() {
         private var autoPlayVoiceNoteUntilTimestamp: Long = 0L
 
         @Volatile
+        private var targetVoiceNoteOffsetFromBottom: Int = 1
+
+        @Volatile
         private var autoPlayYouTubeUntilTimestamp: Long = 0L
 
         fun requestAutoClickSendInWhatsApp() {
             autoClickSendUntilTimestamp = System.currentTimeMillis() + 12_000L
         }
 
-        fun requestAutoPlayVoiceNoteInWhatsApp() {
+        fun requestAutoPlayVoiceNoteInWhatsApp(offsetFromBottom: Int = 1) {
+            targetVoiceNoteOffsetFromBottom = offsetFromBottom.coerceIn(1, 10)
             autoPlayVoiceNoteUntilTimestamp = System.currentTimeMillis() + 10_000L
         }
 

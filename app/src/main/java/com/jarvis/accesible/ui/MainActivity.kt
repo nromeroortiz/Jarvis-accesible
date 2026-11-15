@@ -109,7 +109,7 @@ fun JarvisMainScreen(resumeKey: Int) {
     val coordinator = remember { JarvisCoordinator.getInstance(context) }
 
     var showSetupPanel by remember {
-        mutableStateOf(!checkRuntimePermissions(context) || AppPrefs.getGeminiApiKey(context).isBlank())
+        mutableStateOf(!checkRuntimePermissions(context))
     }
 
     var apiKey by remember { mutableStateOf(AppPrefs.getGeminiApiKey(context)) }
@@ -265,7 +265,7 @@ fun JarvisMainScreen(resumeKey: Int) {
                             },
                             label = {
                                 Text(
-                                    "Clave API (empieza con AIza... sin espacios)",
+                                    "Pegá acá tu Gemini API Key (sin espacios)",
                                     color = Color(0xFFB0BEC5)
                                 )
                             },
@@ -450,12 +450,14 @@ fun JarvisMainScreen(resumeKey: Int) {
                         )
 
                         PermissionRow(
-                            title = "A. Micrófono, Cámara (Billetes), Contactos y Llamadas",
+                            title = "A. Micrófono, Cámara, Ubicación (Clima), Contactos y Llamadas",
                             isGranted = isRuntimePermsOk,
                             onClick = {
                                 val perms = mutableListOf(
                                     Manifest.permission.RECORD_AUDIO,
                                     Manifest.permission.CAMERA,
+                                    Manifest.permission.ACCESS_COARSE_LOCATION,
+                                    Manifest.permission.ACCESS_FINE_LOCATION,
                                     Manifest.permission.READ_CONTACTS,
                                     Manifest.permission.CALL_PHONE,
                                     Manifest.permission.READ_PHONE_STATE
