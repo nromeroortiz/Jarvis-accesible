@@ -27,6 +27,7 @@ import java.text.Normalizer
 import java.util.Calendar
 import java.util.Locale
 import java.util.concurrent.CopyOnWriteArrayList
+import kotlin.math.abs
 
 data class WhatsAppIncomingMessage(
     val id: String,
@@ -173,7 +174,8 @@ object WhatsAppRepository {
         }
     }
 
-    fun cleanSenderTitle(rawTitle: String): String {
+    fun cleanSenderTitle(rawTitle: String?): String {
+        if (rawTitle.isNullOrBlank()) return ""
         return rawTitle
             .replace(Regex("\\s*\\(\\d+\\s+mensajes?\\)", RegexOption.IGNORE_CASE), "")
             .replace(Regex("\\s*\\(\\d+\\s+messages?\\)", RegexOption.IGNORE_CASE), "")
@@ -413,15 +415,21 @@ object WhatsAppRepository {
      */
     fun playLastMessageFromContact(
         context: Context,
-        senderHint: String,
+        senderHint: String?,
         speakCallback: (String, (() -> Unit)?) -> Unit
     ) {
+        val targetQuery = senderHint?.takeIf { it.isNotBlank() } ?: lastOpenedContactName
+        if (targetQuery.isNullOrBlank()) {
+            speakCallback("Decime de qué persona querés escuchar el mensaje.", null)
+            return
+        }
+
         ensureHistoryLoaded(context)
         stopAudioPlayback()
         val currentGen = ++autoAdvanceGeneration
 
-        val contact = findContactByName(context, senderHint)
-        val resolvedName = contact?.first ?: senderHint.trim()
+        val contact = findContactByName(context, targetQuery)
+        val resolvedName = contact?.first ?: targetQuery.trim()
         lastOpenedContactName = resolvedName
 
         val fallbackToSavedMessage = {
@@ -473,12 +481,10 @@ object WhatsAppRepository {
                                 scheduleScreenAudioCompletionMonitor(
                                     context = context,
                                     expectedGen = currentGen,
-                                    expectedDurationMs = lastItem.audioDurationMs,
-                                    speakCallback = { _, onDone ->
-                                        onDone?.invoke()
-                                        JarvisAccessibilityService.returnToHomeScreen(context)
-                                    }
-                                )
+                                    expectedDurationMs = lastItem.audioDurationMs
+                                ) {
+                                    JarvisAccessibilityService.returnToHomeScreen(context)
+                                }
                             }
                         }
                     } else {
@@ -886,9 +892,10 @@ object WhatsAppRepository {
                     scheduleScreenAudioCompletionMonitor(
                         context = context,
                         expectedGen = currentGen,
-                        expectedDurationMs = entry.audioDurationMs,
-                        speakCallback = speakCallback
-                    )
+                        expectedDurationMs = entry.audioDurationMs
+                    ) {
+                        advanceOrFinishDayQueue(context, speakCallback)
+                    }
                 }, startDelayMs)
             }
 
@@ -963,7 +970,7 @@ object WhatsAppRepository {
         context: Context,
         expectedGen: Int,
         expectedDurationMs: Long,
-        speakCallback: (String, (() -> Unit)?) -> Unit
+        onCompleted: () -> Unit
     ) {
         val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
         val startWait = System.currentTimeMillis()
@@ -998,7 +1005,7 @@ object WhatsAppRepository {
                     (!hasSeenAudioPlaying && elapsed >= 2_800L && consecutiveQuietChecks >= 2) ||
                     elapsed >= maxWaitForThisAudio
                 ) {
-                    advanceOrFinishDayQueue(context, speakCallback)
+                    onCompleted()
                 } else if (elapsed < 240_000L) {
                     mainHandler.postDelayed(this, 350L)
                 }

@@ -1954,7 +1954,7 @@ class JarvisAccessibilityService : AccessibilityService() {
             val serv = instance
             if (serv != null) {
                 serv.mainHandler.postDelayed({
-                    serv.performGlobalAction(GLOBAL_ACTION_HOME)
+                    serv.performGlobalAction(AccessibilityService.GLOBAL_ACTION_HOME)
                 }, 550L)
             } else if (context != null) {
                 try {
