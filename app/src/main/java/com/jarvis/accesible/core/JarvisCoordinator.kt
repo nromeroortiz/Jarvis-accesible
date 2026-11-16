@@ -41,6 +41,7 @@ class JarvisCoordinator private constructor(private val context: Context) {
     private var pendingAudioOrTextChoiceForContact: String? = null
     private var pendingDayForContact: String? = null
     private var pendingContinueToTodayForContact: String? = null
+    private var pendingContactForLastMessage: Boolean = false
 
     val speechInput = SpeechInputManager(
         context = context,
@@ -73,6 +74,10 @@ class JarvisCoordinator private constructor(private val context: Context) {
                 }
                 pendingContinueToTodayForContact != null -> {
                     pendingContinueToTodayForContact = null
+                }
+                pendingContactForLastMessage -> {
+                    pendingContactForLastMessage = false
+                    speaker.speak("Cancelado.")
                 }
                 pendingDayForContact != null -> {
                     val contact = pendingDayForContact
@@ -252,6 +257,25 @@ class JarvisCoordinator private constructor(private val context: Context) {
             return
         }
 
+        // 6. Si había preguntado "¿De qué persona querés que lea el último mensaje?"
+        if (pendingContactForLastMessage) {
+            pendingContactForLastMessage = false
+            val clean = userText.trim()
+            val norm = WhatsAppRepository.normalizeText(clean)
+            if (clean.isBlank() || norm == "cancelar" || norm == "nada" || norm == "nadie") {
+                speaker.speak("Cancelado.")
+            } else {
+                val contact = geminiAgent.extractDayFilterFromCommand(norm)?.let { null }
+                    ?: clean.replace(Regex("^(de|del|a|para|chat de)\\s+", RegexOption.IGNORE_CASE), "").trim()
+                speaker.speak("Buscando el último mensaje de $contact.") {
+                    WhatsAppRepository.playLastMessageFromContact(context, contact) { text, onDone ->
+                        speaker.speak(text, onFinished = onDone)
+                    }
+                }
+            }
+            return
+        }
+
         scope.launch {
             isProcessingUiState = true
             val decision = try {
@@ -301,15 +325,46 @@ class JarvisCoordinator private constructor(private val context: Context) {
                     }
                 }
 
+                is AgentDecision.AskContactForLastMessage -> {
+                    pendingContactForLastMessage = true
+                    val prompt = if (decision.onlyAudio) {
+                        "¿De qué persona querés escuchar el último audio?"
+                    } else {
+                        "¿De qué persona querés que lea el último mensaje?"
+                    }
+                    speaker.speak(prompt) {
+                        openMicAfterBeep()
+                    }
+                }
+
                 is AgentDecision.PlayRecentIncomingMessages -> {
-                    WhatsAppRepository.playRecentIncomingFromContact(
-                        context = context,
-                        senderHint = decision.senderName,
-                        onlyAudio = decision.onlyAudio,
-                        count = decision.count,
-                        isPenultimate = decision.isPenultimate
-                    ) { text, onDone ->
-                        speaker.speak(text, onFinished = onDone)
+                    if (decision.senderName.isNullOrBlank()) {
+                        pendingContactForLastMessage = true
+                        val prompt = if (decision.onlyAudio) {
+                            "¿De qué persona querés escuchar el último audio?"
+                        } else {
+                            "¿De qué persona querés que lea el último mensaje?"
+                        }
+                        speaker.speak(prompt) {
+                            openMicAfterBeep()
+                        }
+                    } else if (decision.count == 1 && !decision.isPenultimate && !decision.onlyAudio) {
+                        WhatsAppRepository.playLastMessageFromContact(
+                            context = context,
+                            senderHint = decision.senderName
+                        ) { text, onDone ->
+                            speaker.speak(text, onFinished = onDone)
+                        }
+                    } else {
+                        WhatsAppRepository.playRecentIncomingFromContact(
+                            context = context,
+                            senderHint = decision.senderName,
+                            onlyAudio = decision.onlyAudio,
+                            count = decision.count,
+                            isPenultimate = decision.isPenultimate
+                        ) { text, onDone ->
+                            speaker.speak(text, onFinished = onDone)
+                        }
                     }
                 }
 

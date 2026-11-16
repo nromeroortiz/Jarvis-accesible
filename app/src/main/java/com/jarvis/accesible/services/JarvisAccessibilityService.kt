@@ -168,6 +168,9 @@ class JarvisAccessibilityService : AccessibilityService() {
                     }
                     autoClickSendUntilTimestamp = 0L
                     pendingSendRecipientName = null
+                    mainHandler.postDelayed({
+                        returnToHomeScreen()
+                    }, 2200L)
                 } else if (!pendingSendRecipientName.isNullOrBlank()) {
                     val recipient = pendingSendRecipientName!!
                     if (clickNodeMatchingPhonetically(root, recipient, minTop = chatContentMinTopPx())) {
@@ -570,6 +573,9 @@ class JarvisAccessibilityService : AccessibilityService() {
                 }
             }, 350L)
         }
+        mainHandler.postDelayed({
+            returnToHomeScreen()
+        }, 1800L)
         cb?.invoke("Audio enviado.")
     }
 
@@ -1088,54 +1094,82 @@ class JarvisAccessibilityService : AccessibilityService() {
     /**
      * Detecta si un mensaje o audio de WhatsApp fue enviado por nosotros (burbuja a la derecha)
      * o recibido de la otra persona (burbuja a la izquierda).
-     * En WhatsApp, todo mensaje recibido está en el margen izquierdo (< 20% del ancho de pantalla).
-     * Todo mensaje enviado por nosotros está desplazado a la derecha (>= 20% del ancho de pantalla).
+     * En WhatsApp, los mensajes recibidos están estrictamente anclados al margen izquierdo.
+     * Los mensajes enviados por nosotros contienen tildes de entrega/lectura y están anclados al margen derecho.
      */
     private fun isOutgoingWhatsAppMessageNode(node: AccessibilityNodeInfo, nodeRect: Rect): Boolean {
         val screenW = screenWidthPx()
         if (screenW <= 0) return false
 
-        // 1. Si el elemento está en el margen izquierdo (< 20% del ancho),
-        // es 100% indiscutiblemente un mensaje o audio entrante de la otra persona (Denise).
-        if (nodeRect.left < (screenW * 0.20f).toInt()) {
-            return false
-        }
-
-        // 2. Si el elemento está en la mitad derecha (>= 48% del ancho),
-        // es 100% indiscutiblemente un mensaje o audio saliente enviado por nosotros.
-        if (nodeRect.left >= (screenW * 0.48f).toInt()) {
+        // 1. Verificación definitiva por tildes de estado de mensaje saliente:
+        // En WhatsApp, SOLO los mensajes enviados por nosotros tienen tilde/estado (status/read/delivered/sent/pending).
+        // Los mensajes entrantes de la otra persona NUNCA tienen tildes de envío.
+        if (hasOutgoingStatusTickInBubbleOrAncestors(node)) {
             return true
         }
 
-        // 3. Para elementos intermedios (entre 20% y 48%), comprobamos la burbuja inmediata (hasta 2 niveles arriba)
-        val maxBubbleHeight = (screenHeightPx() * 0.35f).toInt()
+        // 2. Buscamos el contenedor de la burbuja (subiendo en la jerarquía hasta 4 niveles)
+        var bubbleRect = nodeRect
         var current: AccessibilityNodeInfo? = node
         var depth = 0
-        while (current != null && depth < 2) {
+        while (current != null && depth < 4) {
             val p = current.parent ?: break
             val pRect = Rect()
             p.getBoundsInScreen(pRect)
-
-            if (pRect.height() > maxBubbleHeight) {
+            // Si el contenedor tiene un tamaño razonable de burbuja
+            if (pRect.width() in 40..(screenW * 0.98f).toInt() && pRect.height() < (screenHeightPx() * 0.50f).toInt()) {
+                bubbleRect = pRect
+                if (hasOutgoingStatusTickInBubble(p)) {
+                    return true
+                }
                 break
             }
-
-            if (hasOutgoingStatusTickInBubble(p)) {
-                return true
-            }
-
-            val rightMargin = (screenW - pRect.right).coerceAtLeast(0)
-            val leftMargin = pRect.left
-            if (rightMargin < (screenW * 0.15f).toInt() && leftMargin > (screenW * 0.18f).toInt()) {
-                return true
-            }
-
             current = p
             depth++
         }
 
-        // Si su posición izquierda está desplazada más del 22%, es saliente
-        return nodeRect.left > (screenW * 0.22f).toInt()
+        // 3. Regla geométrica basada en el contenedor de la burbuja:
+        // En WhatsApp (LTR):
+        // Una burbuja entrante está anclada a la izquierda:
+        // su borde izquierdo está cerca del margen izquierdo (left < 18% del ancho)
+        // y deja un margen libre grande a la derecha (rightMargin >= 8% del ancho).
+        val leftRatio = bubbleRect.left.toFloat() / screenW
+        val rightMarginRatio = (screenW - bubbleRect.right).toFloat() / screenW
+
+        if (leftRatio < 0.18f && rightMarginRatio >= 0.08f) {
+            return false // 100% entrante de la otra persona
+        }
+
+        // Una burbuja saliente está anclada a la derecha:
+        // su borde derecho está cerca del margen derecho (rightMargin < 14%)
+        // y su borde izquierdo está desplazado hacia la derecha (leftRatio >= 18%).
+        if (rightMarginRatio < 0.14f && leftRatio >= 0.18f) {
+            return true // 100% saliente enviada por nosotros
+        }
+
+        // 4. Si la burbuja entera no se pudo aislar, comprobamos la posición de la vista:
+        // Si el elemento está en la mitad izquierda (< 30% del ancho), es entrante
+        if (nodeRect.left < (screenW * 0.30f).toInt()) {
+            return false
+        }
+
+        // Si está en la mitad derecha (>= 45%), es saliente
+        if (nodeRect.left >= (screenW * 0.45f).toInt()) {
+            return true
+        }
+
+        return false
+    }
+
+    private fun hasOutgoingStatusTickInBubbleOrAncestors(node: AccessibilityNodeInfo): Boolean {
+        var curr: AccessibilityNodeInfo? = node
+        var depth = 0
+        while (curr != null && depth < 4) {
+            if (hasOutgoingStatusTickInBubble(curr)) return true
+            curr = curr.parent
+            depth++
+        }
+        return false
     }
 
     private fun hasOutgoingStatusTickInBubble(bubbleNode: AccessibilityNodeInfo?): Boolean {
@@ -1902,6 +1936,35 @@ class JarvisAccessibilityService : AccessibilityService() {
                         }
                     }
                 }, delay)
+            }
+            // Salvaguarda si pasaron 2800ms y no se detectaron elementos visibles
+            instance?.mainHandler?.postDelayed({
+                if (autoInspectBottomRecentUntilTimestamp > 0L) {
+                    autoInspectBottomRecentUntilTimestamp = 0L
+                    val cb = onBottomRecentItemsReadyCallback
+                    onBottomRecentItemsReadyCallback = null
+                    val root = instance?.rootInActiveWindow
+                    val items = if (root != null) instance?.extractAllVisibleChatItemsFromCurrentScreen(root).orEmpty() else emptyList()
+                    cb?.invoke(items)
+                }
+            }, 2800L)
+        }
+
+        fun returnToHomeScreen(context: android.content.Context? = null) {
+            val serv = instance
+            if (serv != null) {
+                serv.mainHandler.postDelayed({
+                    serv.performGlobalAction(GLOBAL_ACTION_HOME)
+                }, 550L)
+            } else if (context != null) {
+                try {
+                    val homeIntent = android.content.Intent(android.content.Intent.ACTION_MAIN).apply {
+                        addCategory(android.content.Intent.CATEGORY_HOME)
+                        addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
+                    }
+                    context.startActivity(homeIntent)
+                } catch (_: Exception) {
+                }
             }
         }
 

@@ -173,25 +173,39 @@ object WhatsAppRepository {
         }
     }
 
+    fun cleanSenderTitle(rawTitle: String): String {
+        return rawTitle
+            .replace(Regex("\\s*\\(\\d+\\s+mensajes?\\)", RegexOption.IGNORE_CASE), "")
+            .replace(Regex("\\s*\\(\\d+\\s+messages?\\)", RegexOption.IGNORE_CASE), "")
+            .trim()
+    }
+
     fun addIncomingNotification(
         context: Context,
         sender: String,
         text: String,
         replyIntent: PendingIntent?,
-        remoteInputs: Array<RemoteInput>?
+        remoteInputs: Array<RemoteInput>?,
+        messageTimestamp: Long = System.currentTimeMillis(),
+        isVoiceNote: Boolean = false
     ) {
-        val lower = text.lowercase()
-        val isVoiceNote = lower.contains("mensaje de voz") ||
+        val cleanSender = cleanSenderTitle(sender)
+        val cleanText = text.trim()
+        val lower = cleanText.lowercase()
+        val detectedVoiceNote = isVoiceNote ||
+            lower.contains("mensaje de voz") ||
             lower.contains("nota de voz") ||
             lower.contains("audio") ||
-            text.contains("🎤") ||
-            text.contains("🎵")
+            cleanText.contains("🎤") ||
+            cleanText.contains("🎵")
+
         onNewNotificationMessage(
             context = context,
-            id = "${sender}_${System.currentTimeMillis()}",
-            sender = sender,
-            text = text,
-            isVoiceNote = isVoiceNote,
+            id = "${cleanSender}_$messageTimestamp",
+            sender = cleanSender,
+            text = cleanText,
+            isVoiceNote = detectedVoiceNote,
+            timestamp = messageTimestamp,
             replyIntent = replyIntent,
             remoteInputs = remoteInputs
         )
@@ -203,10 +217,11 @@ object WhatsAppRepository {
         sender: String,
         text: String,
         isVoiceNote: Boolean,
+        timestamp: Long = System.currentTimeMillis(),
         replyIntent: PendingIntent?,
         remoteInputs: Array<RemoteInput>?
     ) {
-        val cleanSender = sender.trim()
+        val cleanSender = cleanSenderTitle(sender)
         val cleanText = text.trim()
 
         if (cleanSender.isEmpty() || cleanText.isEmpty()) return
@@ -219,12 +234,13 @@ object WhatsAppRepository {
 
         ioExecutor.execute {
             ensureHistoryLoaded(context.applicationContext)
-            val existingIndex = messages.indexOfFirst {
+            // Deduplicación precisa: si ya existe este mismo mensaje de este remitente con timestamp idéntico o muy cercano, no lo duplicamos
+            val alreadyExists = messages.any {
                 it.senderName.equals(cleanSender, ignoreCase = true) &&
                     it.text == cleanText &&
-                    (System.currentTimeMillis() - it.timestamp) < 25_000L
+                    (abs(it.timestamp - timestamp) < 4_000L || (timestamp == 0L && abs(System.currentTimeMillis() - it.timestamp) < 30_000L))
             }
-            if (existingIndex >= 0) return@execute
+            if (alreadyExists) return@execute
 
             val latestAudioPath = if (isVoiceNote) {
                 findLatestWhatsAppVoiceNoteFile(maxAgeMillis = 180_000L)?.absolutePath
@@ -232,13 +248,15 @@ object WhatsAppRepository {
                 null
             }
 
+            val effectiveTimestamp = if (timestamp > 0L) timestamp else System.currentTimeMillis()
+
             messages.add(
                 WhatsAppIncomingMessage(
                     id = id,
                     senderName = cleanSender,
                     text = cleanText,
                     isVoiceNote = isVoiceNote,
-                    timestamp = System.currentTimeMillis(),
+                    timestamp = effectiveTimestamp,
                     replyPendingIntent = replyIntent,
                     remoteInputs = remoteInputs,
                     associatedAudioPath = latestAudioPath,
@@ -249,11 +267,22 @@ object WhatsAppRepository {
         }
     }
 
+    data class UnreadQueueItem(
+        val messageId: String,
+        val isAudio: Boolean,
+        val spokenIntro: String,
+        val audioFile: File? = null,
+        val senderName: String
+    )
+
     /**
      * MODO RÁPIDO DE CHARLA EN VIVO ("¿Tengo mensajes?", "¿Hay algún mensaje?"):
-     * - Te dice quién te escribió y te lee directamente los mensajes nuevos.
-     * - Si el mensaje nuevo es un audio, apenas termina de avisarte ("Fulano mandó un audio"),
-     *   reproduce ÚNICAMENTE ese audio nuevo (sin volver al principio del día).
+     * - Anuncia de quién son los mensajes ("Tenés mensajes de Nico").
+     * - Lee cada mensaje en orden cronológico (del más viejo al más nuevo):
+     *   "Nico dice: [mensaje]" (sin decir la hora).
+     * - Si es audio, dice "Nico mandó un audio" y lo reproduce.
+     * - Marca como leído mensaje a mensaje ÚNICAMENTE cuando termina de leer/reproducir cada uno.
+     * - Al terminar todos los mensajes, vuelve automáticamente al Inicio (Home).
      */
     fun checkAndPlayUnreadImmediately(
         context: Context,
@@ -261,74 +290,216 @@ object WhatsAppRepository {
     ) {
         ensureHistoryLoaded(context)
         stopAudioPlayback()
-        autoAdvanceGeneration++
+        val currentGen = ++autoAdvanceGeneration
 
-        val unread = messages.filter { !it.isReadByUncle }
+        // Mensajes no leídos ordenados cronológicamente del más viejo al más nuevo
+        val unread = messages.filter { !it.isReadByUncle }.sortedBy { it.timestamp }
         if (unread.isEmpty()) {
-            speakCallback("No tenés mensajes nuevos.", null)
+            speakCallback("No tenés mensajes nuevos.") {
+                JarvisAccessibilityService.returnToHomeScreen(context)
+            }
             return
         }
 
         lastOpenedContactName = unread.last().senderName
-        unread.forEach { it.isReadByUncle = true }
-        saveHistoryToDisk(context)
 
-        // Armamos una cola rápida SOLO con los mensajes/audios nuevos sin leer (no todo el día)
-        val liveQueue = unread.map { msg ->
+        val uniqueSenders = unread.map { it.senderName }.distinct()
+        val introText = when {
+            uniqueSenders.size == 1 && unread.size == 1 -> "Tenés un mensaje de ${uniqueSenders.first()}."
+            uniqueSenders.size == 1 -> "Tenés mensajes de ${uniqueSenders.first()}."
+            else -> "Tenés mensajes de ${uniqueSenders.joinToString(" y ")}."
+        }
+
+        val queueEntries = unread.map { msg ->
             if (msg.isVoiceNote) {
                 val localFile = msg.associatedAudioPath?.let { File(it) }?.takeIf { it.exists() }
                     ?: findLatestWhatsAppVoiceNoteFile(maxAgeMillis = 600_000L)
-                UnifiedChatEntry(
+                UnreadQueueItem(
+                    messageId = msg.id,
                     isAudio = true,
-                    spokenText = "${msg.senderName} mandó un audio.",
-                    localAudioFile = localFile,
-                    screenAudioOrderInDay = -99, // Señal de reproducir solo el último audio en el chat de msg.senderName
-                    dayFilter = msg.senderName
+                    spokenIntro = "${msg.senderName} mandó un audio.",
+                    audioFile = localFile,
+                    senderName = msg.senderName
                 )
             } else {
-                UnifiedChatEntry(
+                UnreadQueueItem(
+                    messageId = msg.id,
                     isAudio = false,
-                    spokenText = "${msg.senderName} dice: ${msg.text}.",
-                    dayFilter = "hoy"
+                    spokenIntro = "${msg.senderName} dice: ${msg.text}.",
+                    audioFile = null,
+                    senderName = msg.senderName
                 )
             }
         }
 
-        activeQueue = liveQueue
-        activeQueueIndex = 0
-        playLiveUnreadQueue(context, speakCallback)
+        speakCallback(introText) {
+            if (currentGen == autoAdvanceGeneration) {
+                playUnreadQueueStep(context, queueEntries, 0, currentGen, speakCallback)
+            }
+        }
     }
 
-    private fun playLiveUnreadQueue(
+    private fun playUnreadQueueStep(
         context: Context,
+        queue: List<UnreadQueueItem>,
+        index: Int,
+        gen: Int,
         speakCallback: (String, (() -> Unit)?) -> Unit
     ) {
-        if (activeQueueIndex !in activeQueue.indices) return
-        val currentGen = ++autoAdvanceGeneration
-        val entry = activeQueue[activeQueueIndex]
+        if (gen != autoAdvanceGeneration) return
 
-        if (!entry.isAudio) {
-            speakCallback(entry.spokenText) {
-                if (currentGen == autoAdvanceGeneration && activeQueueIndex + 1 <= activeQueue.lastIndex) {
-                    activeQueueIndex++
-                    playLiveUnreadQueue(context, speakCallback)
+        if (index !in queue.indices) {
+            JarvisAccessibilityService.returnToHomeScreen(context)
+            return
+        }
+
+        val item = queue[index]
+
+        val markCurrentAsRead = {
+            val foundMsg = messages.firstOrNull { it.id == item.messageId }
+            if (foundMsg != null && !foundMsg.isReadByUncle) {
+                foundMsg.isReadByUncle = true
+                saveHistoryToDisk(context)
+            }
+        }
+
+        if (!item.isAudio) {
+            speakCallback(item.spokenIntro) {
+                if (gen == autoAdvanceGeneration) {
+                    markCurrentAsRead()
+                    mainHandler.postDelayed({
+                        if (gen == autoAdvanceGeneration) {
+                            playUnreadQueueStep(context, queue, index + 1, gen, speakCallback)
+                        }
+                    }, 220L)
                 }
             }
         } else {
-            // Primero anuncia "Fulano mandó un audio" y en el acto lo reproduce
-            speakCallback(entry.spokenText) {
-                if (currentGen != autoAdvanceGeneration) return@speakCallback
-                if (entry.localAudioFile != null && entry.localAudioFile.exists()) {
-                    playSingleAudioFile(entry.localAudioFile) { _, _ ->
-                        if (currentGen == autoAdvanceGeneration && activeQueueIndex + 1 <= activeQueue.lastIndex) {
-                            activeQueueIndex++
-                            playLiveUnreadQueue(context, speakCallback)
+            speakCallback(item.spokenIntro) {
+                if (gen != autoAdvanceGeneration) return@speakCallback
+                if (item.audioFile != null && item.audioFile.exists()) {
+                    playSingleAudioFile(item.audioFile) { _, _ ->
+                        if (gen == autoAdvanceGeneration) {
+                            markCurrentAsRead()
+                            mainHandler.postDelayed({
+                                if (gen == autoAdvanceGeneration) {
+                                    playUnreadQueueStep(context, queue, index + 1, gen, speakCallback)
+                                }
+                            }, 220L)
                         }
                     }
                 } else {
-                    playLatestSingleAudioOnly(context, entry.dayFilter, speakCallback)
+                    markCurrentAsRead()
+                    if (index + 1 in queue.indices) {
+                        mainHandler.postDelayed({
+                            if (gen == autoAdvanceGeneration) {
+                                playUnreadQueueStep(context, queue, index + 1, gen, speakCallback)
+                            }
+                        }, 220L)
+                    } else {
+                        JarvisAccessibilityService.returnToHomeScreen(context)
+                    }
                 }
             }
+        }
+    }
+
+    /**
+     * Lee directamente el ÚLTIMO MENSAJE recibido de una persona:
+     * - Abre el chat e inspecciona el final de la pantalla (donde abre WhatsApp), SIN scrollear hacia arriba.
+     * - Si es texto, dice: "Nico dice: [mensaje]" (sin decir la hora).
+     * - Si es audio, dice: "Nico mandó un audio" y lo reproduce.
+     * - Al terminar vuelve a la pantalla de Inicio (Home) para que sigan entrando notificaciones.
+     */
+    fun playLastMessageFromContact(
+        context: Context,
+        senderHint: String,
+        speakCallback: (String, (() -> Unit)?) -> Unit
+    ) {
+        ensureHistoryLoaded(context)
+        stopAudioPlayback()
+        val currentGen = ++autoAdvanceGeneration
+
+        val contact = findContactByName(context, senderHint)
+        val resolvedName = contact?.first ?: senderHint.trim()
+        lastOpenedContactName = resolvedName
+
+        val fallbackToSavedMessage = {
+            val savedMsg = messages
+                .filter { isPhoneticMatch(it.senderName, resolvedName) }
+                .maxByOrNull { it.timestamp }
+
+            if (savedMsg != null) {
+                if (savedMsg.isVoiceNote) {
+                    val localFile = savedMsg.associatedAudioPath?.let { File(it) }?.takeIf { it.exists() }
+                        ?: findLatestWhatsAppVoiceNoteFile(maxAgeMillis = 600_000L)
+                    speakCallback("$resolvedName mandó un audio.") {
+                        if (localFile != null && localFile.exists()) {
+                            playSingleAudioFile(localFile) { _, _ ->
+                                JarvisAccessibilityService.returnToHomeScreen(context)
+                            }
+                        } else {
+                            JarvisAccessibilityService.returnToHomeScreen(context)
+                        }
+                    }
+                } else {
+                    speakCallback("$resolvedName dice: ${savedMsg.text}.") {
+                        JarvisAccessibilityService.returnToHomeScreen(context)
+                    }
+                }
+            } else {
+                speakCallback("No encontré mensajes recientes de $resolvedName.") {
+                    JarvisAccessibilityService.returnToHomeScreen(context)
+                }
+            }
+        }
+
+        val onChatReadyToInspect = {
+            JarvisAccessibilityService.requestInspectBottomChatItems { screenItems ->
+                if (currentGen != autoAdvanceGeneration) return@requestInspectBottomChatItems
+                // Filtramos estrictamente los mensajes recibidos de la otra persona (!it.isOutgoing)
+                val incomingOnly = screenItems.filter { !it.isOutgoing }
+                if (incomingOnly.isNotEmpty()) {
+                    val lastItem = incomingOnly.last()
+                    if (lastItem.isAudio) {
+                        speakCallback("$resolvedName mandó un audio.") {
+                            val clicked = JarvisAccessibilityService.instance?.clickLatestAudioInCurrentChatScreen(
+                                fromBottomIndex = 0,
+                                onlyIncoming = true
+                            ) ?: false
+                            if (!clicked) {
+                                fallbackToSavedMessage()
+                            } else {
+                                scheduleScreenAudioCompletionMonitor(
+                                    context = context,
+                                    expectedGen = currentGen,
+                                    expectedDurationMs = lastItem.audioDurationMs,
+                                    speakCallback = { _, onDone ->
+                                        onDone?.invoke()
+                                        JarvisAccessibilityService.returnToHomeScreen(context)
+                                    }
+                                )
+                            }
+                        }
+                    } else {
+                        speakCallback("$resolvedName dice: ${lastItem.text}.") {
+                            JarvisAccessibilityService.returnToHomeScreen(context)
+                        }
+                    }
+                } else {
+                    fallbackToSavedMessage()
+                }
+            }
+        }
+
+        if (contact != null) {
+            onChatReadyToInspect()
+            openWhatsAppChatByPhone(context, contact.second)
+        } else {
+            JarvisAccessibilityService.requestSearchAndOpenChatInWhatsApp(resolvedName) {
+                onChatReadyToInspect()
+            }
+            launchWhatsAppHome(context)
         }
     }
 
@@ -363,12 +534,18 @@ object WhatsAppRepository {
         isPenultimate: Boolean = false,
         speakCallback: (String, (() -> Unit)?) -> Unit
     ) {
+        val targetPerson = senderHint?.takeIf { it.isNotBlank() } ?: lastOpenedContactName
+
+        // Si es pedir el último mensaje normal (texto o audio) de una persona:
+        if (count == 1 && !isPenultimate && !onlyAudio && !targetPerson.isNullOrBlank()) {
+            playLastMessageFromContact(context, targetPerson, speakCallback)
+            return
+        }
+
         ensureHistoryLoaded(context)
         stopAudioPlayback()
         autoAdvanceGeneration++
         activeQueueContactName = null
-
-        val targetPerson = senderHint?.takeIf { it.isNotBlank() } ?: lastOpenedContactName
 
         val handleExtractedScreenItems: (List<ScreenChatItem>, String) -> Unit = { screenItems, displayPerson ->
             // Filtramos estrictamente los recibidos de la otra persona (!it.isOutgoing)
@@ -387,8 +564,8 @@ object WhatsAppRepository {
 
             if (selectedItems.isNotEmpty()) {
                 lastLoadedScreenItems = selectedItems
-                activeQueueContactName = null // No scrollear hacia abajo al terminar estos mensajes puntuales
-                activeQueue = mapScreenItemsToEntries(selectedItems, "hoy")
+                activeQueueContactName = null
+                activeQueue = mapScreenItemsToEntries(selectedItems, "hoy", displayPerson)
                 activeQueueIndex = 0
                 playCurrentQueueEntryAndAutoAdvance(context, speakCallback)
             } else {
@@ -408,7 +585,9 @@ object WhatsAppRepository {
                     playCurrentQueueEntryAndAutoAdvance(context, speakCallback)
                 } else {
                     val label = if (onlyAudio) "audios" else "mensajes"
-                    speakCallback("No encontré $label recientes de $displayPerson.", null)
+                    speakCallback("No encontré $label recientes de $displayPerson.") {
+                        JarvisAccessibilityService.returnToHomeScreen(context)
+                    }
                 }
             }
         }
@@ -418,8 +597,9 @@ object WhatsAppRepository {
             val resolvedName = contact?.first ?: targetPerson
             lastOpenedContactName = resolvedName
 
+            // Inspeccionamos al final de la pantalla SIN scrollear hacia arriba
             val onChatReadyToInspect = {
-                JarvisAccessibilityService.requestInspectOpenChatForDay("hoy") { screenItems ->
+                JarvisAccessibilityService.requestInspectBottomChatItems { screenItems ->
                     val finalItems = if (screenItems.isNotEmpty()) {
                         screenItems
                     } else {
@@ -461,7 +641,13 @@ object WhatsAppRepository {
             val chosenOpus = if (isPenultimate && recentOpusList.size >= 2) recentOpusList[1] else recentOpusList.firstOrNull()
             if (chosenOpus != null) {
                 playSingleAudioFile(chosenOpus) { ok, err ->
-                    if (!ok && err.isNotBlank()) speakCallback(err, null)
+                    if (!ok && err.isNotBlank()) {
+                        speakCallback(err) {
+                            JarvisAccessibilityService.returnToHomeScreen(context)
+                        }
+                    } else {
+                        JarvisAccessibilityService.returnToHomeScreen(context)
+                    }
                 }
                 return
             }
@@ -531,7 +717,7 @@ object WhatsAppRepository {
                 JarvisAccessibilityService.requestInspectOpenChatForDay(dayFilter) { screenItems ->
                     if (screenItems.isNotEmpty()) {
                         lastLoadedScreenItems = screenItems
-                        activeQueue = mapScreenItemsToEntries(screenItems, dayFilter)
+                        activeQueue = mapScreenItemsToEntries(screenItems, dayFilter, resolvedDisplayName)
                         activeQueueIndex = 0
                         playCurrentQueueEntryAndAutoAdvance(context, speakCallback)
                     } else {
@@ -542,7 +728,9 @@ object WhatsAppRepository {
                             activeQueueIndex = 0
                             playCurrentQueueEntryAndAutoAdvance(context, speakCallback)
                         } else {
-                            speakCallback("No encontré mensajes de $dayFilter en el chat de $resolvedDisplayName.", null)
+                            speakCallback("No encontré mensajes de $dayFilter en el chat de $resolvedDisplayName.") {
+                                JarvisAccessibilityService.returnToHomeScreen(context)
+                            }
                         }
                     }
                 }
@@ -572,11 +760,20 @@ object WhatsAppRepository {
         playCurrentQueueEntryAndAutoAdvance(context, speakCallback)
     }
 
-    private fun mapScreenItemsToEntries(screenItems: List<ScreenChatItem>, dayFilter: String): List<UnifiedChatEntry> {
+    private fun mapScreenItemsToEntries(
+        screenItems: List<ScreenChatItem>,
+        dayFilter: String,
+        contactName: String? = null
+    ): List<UnifiedChatEntry> {
+        val otherName = contactName?.takeIf { it.isNotBlank() } ?: "Te dijeron"
         return screenItems.map { item ->
             if (!item.isAudio) {
                 alreadyReadTextsInCurrentDay.add(item.text)
-                val spoken = if (item.isOutgoing) "Vos: ${item.text}" else item.text
+                val spoken = if (item.isOutgoing) {
+                    "Vos dijiste: ${item.text}."
+                } else {
+                    "$otherName dice: ${item.text}."
+                }
                 UnifiedChatEntry(
                     isAudio = false,
                     spokenText = spoken,
@@ -585,9 +782,14 @@ object WhatsAppRepository {
                     dayFilter = dayFilter
                 )
             } else {
+                val spoken = if (item.isOutgoing) {
+                    "Vos mandaste un audio."
+                } else {
+                    "$otherName mandó un audio."
+                }
                 UnifiedChatEntry(
                     isAudio = true,
-                    spokenText = "",
+                    spokenText = spoken,
                     screenAudioOrderInDay = item.audioOrderInDay,
                     screenTopY = item.topY,
                     audioDurationMs = item.audioDurationMs,
@@ -602,11 +804,15 @@ object WhatsAppRepository {
         speakCallback: (String, (() -> Unit)?) -> Unit
     ) {
         if (activeQueue.isEmpty()) {
-            speakCallback("No hay mensajes en la lista.", null)
+            speakCallback("No hay mensajes en la lista.") {
+                JarvisAccessibilityService.returnToHomeScreen(context)
+            }
             return
         }
         if (activeQueueIndex !in activeQueue.indices) {
-            speakCallback("Ese fue el último mensaje.", null)
+            speakCallback("Ese fue el último mensaje.") {
+                JarvisAccessibilityService.returnToHomeScreen(context)
+            }
             return
         }
 
@@ -627,51 +833,78 @@ object WhatsAppRepository {
                 }, 220L)
             }
         } else if (entry.localAudioFile != null && entry.localAudioFile.exists()) {
-            playSingleAudioFile(entry.localAudioFile) { ok, errMsg ->
-                if (!ok && errMsg.isNotBlank()) {
-                    speakCallback(errMsg, null)
-                } else if (currentGen == autoAdvanceGeneration) {
-                    advanceOrFinishDayQueue(context, speakCallback)
+            val playAction = {
+                playSingleAudioFile(entry.localAudioFile) { ok, errMsg ->
+                    if (!ok && errMsg.isNotBlank()) {
+                        speakCallback(errMsg, null)
+                    } else if (currentGen == autoAdvanceGeneration) {
+                        advanceOrFinishDayQueue(context, speakCallback)
+                    }
                 }
+            }
+            if (entry.spokenText.isNotBlank()) {
+                speakCallback(entry.spokenText) {
+                    if (currentGen == autoAdvanceGeneration) {
+                        playAction()
+                    }
+                }
+            } else {
+                playAction()
             }
         } else if (entry.screenAudioOrderInDay >= 0) {
             val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
-            val startDelayMs = if (activeQueueIndex > 0 && !prevWasAudio) 160L else 0L
+            val playScreenAudioAction = {
+                val startDelayMs = if (activeQueueIndex > 0 && !prevWasAudio) 160L else 0L
 
-            mainHandler.postDelayed({
-                if (currentGen != autoAdvanceGeneration) return@postDelayed
-
-                val clicked = JarvisAccessibilityService.instance?.clickAudioInCurrentScreenByDayOrder(
-                    entry.dayFilter,
-                    entry.screenAudioOrderInDay,
-                    entry.screenTopY
-                ) ?: false
-
-                // Si en un celular gama baja (A01/A21s) el primer toque no arrancó el audio a los 380ms, reintentamos una vez
                 mainHandler.postDelayed({
                     if (currentGen != autoAdvanceGeneration) return@postDelayed
-                    val musicActive = try {
-                        audioManager.isMusicActive
-                    } catch (_: Exception) {
-                        false
-                    }
-                    val pauseVisible = JarvisAccessibilityService.instance?.isAnyVoiceNoteCurrentlyPlayingOnScreen() ?: false
-                    if (!clicked || (!musicActive && !pauseVisible)) {
-                        JarvisAccessibilityService.instance?.clickAudioInCurrentScreenByDayOrder(
-                            entry.dayFilter,
-                            entry.screenAudioOrderInDay,
-                            entry.screenTopY
-                        )
-                    }
-                }, 380L)
 
-                scheduleScreenAudioCompletionMonitor(
-                    context = context,
-                    expectedGen = currentGen,
-                    expectedDurationMs = entry.audioDurationMs,
-                    speakCallback = speakCallback
-                )
-            }, startDelayMs)
+                    val clicked = JarvisAccessibilityService.instance?.clickAudioInCurrentScreenByDayOrder(
+                        entry.dayFilter,
+                        entry.screenAudioOrderInDay,
+                        entry.screenTopY
+                    ) ?: false
+
+                    // Si en un celular gama baja (A01/A21s) el primer toque no arrancó el audio a los 380ms, reintentamos una vez
+                    mainHandler.postDelayed({
+                        if (currentGen != autoAdvanceGeneration) return@postDelayed
+                        val musicActive = try {
+                            audioManager.isMusicActive
+                        } catch (_: Exception) {
+                            false
+                        }
+                        val pauseVisible = JarvisAccessibilityService.instance?.isAnyVoiceNoteCurrentlyPlayingOnScreen() ?: false
+                        if (!clicked || (!musicActive && !pauseVisible)) {
+                            JarvisAccessibilityService.instance?.clickAudioInCurrentScreenByDayOrder(
+                                entry.dayFilter,
+                                entry.screenAudioOrderInDay,
+                                entry.screenTopY
+                            )
+                        }
+                    }, 380L)
+
+                    scheduleScreenAudioCompletionMonitor(
+                        context = context,
+                        expectedGen = currentGen,
+                        expectedDurationMs = entry.audioDurationMs,
+                        speakCallback = speakCallback
+                    )
+                }, startDelayMs)
+            }
+
+            if (entry.spokenText.isNotBlank()) {
+                speakCallback(entry.spokenText) {
+                    if (currentGen == autoAdvanceGeneration) {
+                        mainHandler.postDelayed({
+                            if (currentGen == autoAdvanceGeneration) {
+                                playScreenAudioAction()
+                            }
+                        }, 120L)
+                    }
+                }
+            } else {
+                playScreenAudioAction()
+            }
         }
     }
 
@@ -695,19 +928,19 @@ object WhatsAppRepository {
             ) { moreScreenItems ->
                 if (moreScreenItems.isNotEmpty()) {
                     lastLoadedScreenItems = moreScreenItems
-                    activeQueue = mapScreenItemsToEntries(moreScreenItems, activeQueueDayFilter)
+                    activeQueue = mapScreenItemsToEntries(moreScreenItems, activeQueueDayFilter, activeQueueContactName)
                     activeQueueIndex = 0
                     playCurrentQueueEntryAndAutoAdvance(context, speakCallback)
                 } else {
-                    notifyEndOfDayReached(speakCallback)
+                    notifyEndOfDayReached(context, speakCallback)
                 }
             }
         } else {
-            notifyEndOfDayReached(speakCallback)
+            notifyEndOfDayReached(context, speakCallback)
         }
     }
 
-    private fun notifyEndOfDayReached(speakCallback: ((String, (() -> Unit)?) -> Unit)? = null) {
+    private fun notifyEndOfDayReached(context: Context? = null, speakCallback: ((String, (() -> Unit)?) -> Unit)? = null) {
         val finishedDay = activeQueueDayFilter
         val contact = activeQueueContactName
         activeQueueContactName = null
@@ -718,7 +951,11 @@ object WhatsAppRepository {
             cb?.invoke(contact, finishedDay)
         } else if (!contact.isNullOrBlank()) {
             val msg = if (finishedDay == "hoy") "Ese fue el último mensaje de hoy." else "Ese fue el último mensaje de $finishedDay."
-            speakCallback?.invoke(msg, null)
+            speakCallback?.invoke(msg) {
+                JarvisAccessibilityService.returnToHomeScreen(context)
+            }
+        } else {
+            JarvisAccessibilityService.returnToHomeScreen(context)
         }
     }
 
@@ -801,16 +1038,20 @@ object WhatsAppRepository {
                     ) { moreScreenItems ->
                         if (moreScreenItems.isNotEmpty()) {
                             lastLoadedScreenItems = moreScreenItems
-                            activeQueue = mapScreenItemsToEntries(moreScreenItems, activeQueueDayFilter)
+                            activeQueue = mapScreenItemsToEntries(moreScreenItems, activeQueueDayFilter, activeQueueContactName)
                             activeQueueIndex = 0
                             playCurrentQueueEntryAndAutoAdvance(context, speakCallback)
                         } else {
                             activeQueueContactName = null
-                            speakCallback("Ese fue el último mensaje.", null)
+                            speakCallback("Ese fue el último mensaje.") {
+                                JarvisAccessibilityService.returnToHomeScreen(context)
+                            }
                         }
                     }
                 } else {
-                    speakCallback("Ese fue el último mensaje.", null)
+                    speakCallback("Ese fue el último mensaje.") {
+                        JarvisAccessibilityService.returnToHomeScreen(context)
+                    }
                 }
                 return
             }
@@ -1065,6 +1306,7 @@ object WhatsAppRepository {
                 }
                 RemoteInput.addResultsToIntent(recentMsg.remoteInputs, fillInIntent, bundle)
                 recentMsg.replyPendingIntent.send(context, 0, fillInIntent)
+                JarvisAccessibilityService.returnToHomeScreen(context)
                 return "Enviado a ${recentMsg.senderName}."
             } catch (_: Exception) {
             }

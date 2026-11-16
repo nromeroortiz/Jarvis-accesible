@@ -23,6 +23,7 @@ sealed class AgentDecision {
     data class CheckConnectionOnly(val dummy: Boolean = true) : AgentDecision()
     data class CheckWeather(val rawQuery: String) : AgentDecision()
     data class CheckUnreadWhatsApp(val dummy: Boolean = true) : AgentDecision()
+    data class AskContactForLastMessage(val onlyAudio: Boolean = false) : AgentDecision()
     data class PlayLatestSingleVoiceNote(val senderName: String? = null) : AgentDecision()
     data class PlayRecentIncomingMessages(
         val senderName: String? = null,
@@ -531,6 +532,7 @@ class GeminiAgent(private val context: Context) {
             // B) ¿Pidió "el último mensaje/audio", "anteúltimo", "últimos 3", "lo que me mandó/dijo"?
             // -> Reproduce o lee ÚNICAMENTE los recibidos de la otra persona (ignorando los nuestros)
             val isRecentIncomingQuery = norm.contains("ultimo") ||
+                norm.contains("ultima") ||
                 norm.contains("anteultimo") ||
                 norm.contains("penultimo") ||
                 norm.contains("lo ultimo") ||
@@ -541,6 +543,10 @@ class GeminiAgent(private val context: Context) {
 
             if (isRecentIncomingQuery) {
                 val isOnlyAudio = hasAudioWord && !norm.contains("mensaje") && !norm.contains("texto")
+                if (contact.isNullOrBlank()) {
+                    return AgentDecision.AskContactForLastMessage(onlyAudio = isOnlyAudio)
+                }
+
                 val isPenultimate = norm.contains("anteultimo") || norm.contains("penultimo")
                 val countMatch = Regex("ultim[oa]s?\\s+(\\d+)").find(norm)
                 val count = when {
@@ -656,15 +662,16 @@ class GeminiAgent(private val context: Context) {
         val patterns = listOf(
             Regex("(?:enviale|enviarle|envia|enviar|mandale|mandar|manda|grabale|grabar|graba)\\s+(?:un\\s+)?(?:audio|mensaje de voz|nota de voz|mensaje|texto|whatsapp)\\s+(?:a|para)\\s+([a-zA-Z0-9áéíóúÁÉÍÓÚñÑ ]+)"),
             Regex("(?:contestale a|contestar a|respondele a|responder a|enviale a|enviarle a|mandale a|grabale a|grabar audio para|audio a|audio para|mensaje a|mensaje para|whatsapp a|escribile a|decile a)\\s+([a-zA-Z0-9áéíóúÁÉÍÓÚñÑ ]+)"),
-            Regex("(?:chat de|chat con|conversacion con|audios? de|mensajes? de|lo ultimo de|lo de|escribio|mando|dijo)\\s+([a-zA-Z0-9áéíóúÁÉÍÓÚñÑ ]+)"),
+            Regex("(?:chat de|chat con|conversacion con|audios? de|mensajes? de|ultimo mensaje de|ultima nota de|ultimo audio de|lo ultimo de|lo de|ultimo de|ultima de|el ultimo de|la ultima de)\\s+([a-zA-Z0-9áéíóúÁÉÍÓÚñÑ ]+)"),
+            Regex("(?:que me mando|que me dijo|lo que me mando|lo que me dijo|escribio|mando|dijo)\\s+([a-zA-Z0-9áéíóúÁÉÍÓÚñÑ ]+)"),
             Regex("(?:llama a|llamar a|comunicame con|hablar con)\\s+([a-zA-Z0-9áéíóúÁÉÍÓÚñÑ ]+)")
         )
         for (regex in patterns) {
             val match = regex.find(withoutDays)
             if (match != null) {
                 val candidate = match.groupValues[1]
-                    .replace(Regex("^\\b(ayer|hoy|lunes|martes|miercoles|jueves|viernes|sabado|domingo|dia|el|la|los|las|y|de|persona)\\b\\s*"), "")
-                    .replace(Regex("\\b(ayer|hoy|lunes|martes|miercoles|jueves|viernes|sabado|domingo|dia|que|por|en|un|una|ultimo|penultimo|anterior|reproduci|escuchar|audio|audios|whatsapp)\\b.*"), "")
+                    .replace(Regex("^\\b(ayer|hoy|lunes|martes|miercoles|jueves|viernes|sabado|domingo|dia|el|la|los|las|y|de|del|persona)\\b\\s*"), "")
+                    .replace(Regex("\\b(ayer|hoy|lunes|martes|miercoles|jueves|viernes|sabado|domingo|dia|que|por|en|un|una|ultimo|ultima|penultimo|anterior|reproduci|escuchar|audio|audios|whatsapp|mensaje|mensajes)\\b.*"), "")
                     .trim()
                 if (candidate.length >= 2) return candidate
             }
