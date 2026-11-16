@@ -30,7 +30,7 @@ if "%EXISTING_URL%"=="" (
 echo.
 echo Guardando cambios y subiendo a GitHub...
 git add .
-git commit -m "Wally Accesible: actualizacion general, linterna, audios nativos de WhatsApp y mejoras de voz"
+git commit -m "Wally Accesible: correccion ultimo mensaje, filtro audios entrantes y fin de dia sin bucle"
 git push -u origin main --force
 
 echo.

@@ -301,6 +301,18 @@ class JarvisCoordinator private constructor(private val context: Context) {
                     }
                 }
 
+                is AgentDecision.PlayRecentIncomingMessages -> {
+                    WhatsAppRepository.playRecentIncomingFromContact(
+                        context = context,
+                        senderHint = decision.senderName,
+                        onlyAudio = decision.onlyAudio,
+                        count = decision.count,
+                        isPenultimate = decision.isPenultimate
+                    ) { text, onDone ->
+                        speaker.speak(text, onFinished = onDone)
+                    }
+                }
+
                 is AgentDecision.OpenWhatsAppChatAndAskDay -> {
                     val displayName = WhatsAppRepository.openContactChatOnly(context, decision.senderName)
                     pendingDayForContact = displayName

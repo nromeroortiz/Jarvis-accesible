@@ -32,7 +32,8 @@ data class ScreenChatItem(
     val text: String,
     val topY: Int,
     val audioOrderInDay: Int,
-    val audioDurationMs: Long = 6_000L
+    val audioDurationMs: Long = 6_000L,
+    val isOutgoing: Boolean = false
 )
 
 class JarvisAccessibilityService : AccessibilityService() {
@@ -41,6 +42,7 @@ class JarvisAccessibilityService : AccessibilityService() {
     private var lastVolumeUpDownTime = 0L
     private var pendingChatInspectRunnable: Runnable? = null
     private var scrollAttemptsLeft = 0
+    private var scrollDownPagesLeft = 0
     private var searchAlternateTried = false
     private var silenceMonitorAudioRecord: AudioRecord? = null
 
@@ -144,7 +146,8 @@ class JarvisAccessibilityService : AccessibilityService() {
                 (now < autoSearchContactUntilTimestamp && pendingSearchContactName != null) ||
                 now < autoStartNativeMicUntilTimestamp ||
                 now < autoPlayLatestSingleAudioUntilTimestamp ||
-                now < autoInspectDayChatUntilTimestamp
+                now < autoInspectDayChatUntilTimestamp ||
+                now < autoInspectBottomRecentUntilTimestamp
 
             // Salida ultrarrápida para celulares de bajos recursos (A01 / A21s):
             // si no hay ninguna tarea activa de Wally en curso, no pedimos rootInActiveWindow ni recorremos nodos.
@@ -225,6 +228,26 @@ class JarvisAccessibilityService : AccessibilityService() {
                         pendingChatInspectRunnable = null
                         val freshRoot = rootInActiveWindow ?: return@Runnable
                         processOpenChatForRequestedDay(freshRoot)
+                    }
+                    pendingChatInspectRunnable = runnable
+                    mainHandler.postDelayed(runnable, 360L)
+                }
+                return
+            }
+
+            // F) Inspeccionar los últimos mensajes/audios recibidos al final del chat abierto ("el último", "anteúltimo", "últimos 3")
+            if (now < autoInspectBottomRecentUntilTimestamp) {
+                if (pendingChatInspectRunnable == null) {
+                    val runnable = Runnable {
+                        pendingChatInspectRunnable = null
+                        val freshRoot = rootInActiveWindow ?: return@Runnable
+                        val items = extractAllVisibleChatItemsFromCurrentScreen(freshRoot)
+                        if (items.isNotEmpty()) {
+                            autoInspectBottomRecentUntilTimestamp = 0L
+                            val cb = onBottomRecentItemsReadyCallback
+                            onBottomRecentItemsReadyCallback = null
+                            cb?.invoke(items)
+                        }
                     }
                     pendingChatInspectRunnable = runnable
                     mainHandler.postDelayed(runnable, 360L)
@@ -766,15 +789,23 @@ class JarvisAccessibilityService : AccessibilityService() {
 
     fun scrollDownForMoreItemsInSameDay(
         dayFilterRaw: String,
+        previousScreenItems: List<ScreenChatItem>,
         alreadyReadTexts: Set<String>,
         onMoreItemsLoaded: (List<ScreenChatItem>) -> Unit
     ) {
+        if (scrollDownPagesLeft <= 0) {
+            onMoreItemsLoaded(emptyList())
+            return
+        }
         val root = rootInActiveWindow
         if (root == null || !scrollChatListForward(root)) {
             onMoreItemsLoaded(emptyList())
             return
         }
+        scrollDownPagesLeft--
+        val prevBottom = previousScreenItems.lastOrNull()
         val targetDay = normalize(dayFilterRaw.ifBlank { "hoy" })
+
         mainHandler.postDelayed({
             val fresh = rootInActiveWindow
             if (fresh == null) {
@@ -782,10 +813,59 @@ class JarvisAccessibilityService : AccessibilityService() {
                 return@postDelayed
             }
             val extracted = extractChatItemsByDayFromTree(fresh, targetDay, allowWithoutBannerIfContinuing = true)
-            val newItems = extracted.items.filter { item ->
-                item.isAudio || !alreadyReadTexts.contains(item.text)
+            val afterItems = extracted.items
+            if (afterItems.isEmpty()) {
+                onMoreItemsLoaded(emptyList())
+                return@postDelayed
             }
-            onMoreItemsLoaded(newItems)
+
+            // 1. Si el último elemento de abajo está en la misma posición vertical y es igual al anterior,
+            // significa que el chat ya llegó al fondo y no se movió nada -> cortamos para no entrar en bucle.
+            if (prevBottom != null) {
+                val afterBottom = afterItems.last()
+                val sameBottomPos = abs(afterBottom.topY - prevBottom.topY) < (26f * densityScale()).toInt()
+                if (sameBottomPos && afterBottom.isAudio == prevBottom.isAudio && afterBottom.text == prevBottom.text) {
+                    onMoreItemsLoaded(emptyList())
+                    return@postDelayed
+                }
+
+                // 2. Buscamos cuántos elementos del final de la pantalla anterior coinciden con el principio de la pantalla nueva
+                val maxOverlap = minOf(previousScreenItems.size, afterItems.size)
+                var matchedOverlap = 0
+                for (k in maxOverlap downTo 1) {
+                    var allMatch = true
+                    for (idx in 0 until k) {
+                        val prevElem = previousScreenItems[previousScreenItems.size - k + idx]
+                        val nextElem = afterItems[idx]
+                        if (prevElem.isAudio != nextElem.isAudio || prevElem.text != nextElem.text) {
+                            allMatch = false
+                            break
+                        }
+                    }
+                    if (allMatch) {
+                        matchedOverlap = k
+                        break
+                    }
+                }
+
+                if (matchedOverlap > 0) {
+                    val strictlyNewItems = afterItems.drop(matchedOverlap)
+                    onMoreItemsLoaded(strictlyNewItems)
+                    return@postDelayed
+                }
+            }
+
+            // 3. Si fue un salto completo de pantalla sin superposición, solo avanzamos si aparecieron textos nuevos no leídos
+            val unreadTextsOnly = afterItems.filter { !it.isAudio && !alreadyReadTexts.contains(it.text) }
+            if (unreadTextsOnly.isEmpty()) {
+                onMoreItemsLoaded(emptyList())
+            } else {
+                val firstNewTopY = unreadTextsOnly.first().topY
+                val itemsFromFirstNew = afterItems.filter {
+                    it.topY >= firstNewTopY && (it.isAudio || !alreadyReadTexts.contains(it.text))
+                }
+                onMoreItemsLoaded(itemsFromFirstNew)
+            }
         }, 480L)
     }
 
@@ -800,8 +880,59 @@ class JarvisAccessibilityService : AccessibilityService() {
         val type: String,
         val text: String,
         val topY: Int,
-        val durationMs: Long = 0L
+        val durationMs: Long = 0L,
+        val isOutgoing: Boolean = false
     )
+
+    fun extractAllVisibleChatItemsFromCurrentScreen(
+        rootNode: AccessibilityNodeInfo? = rootInActiveWindow
+    ): List<ScreenChatItem> {
+        val root = rootNode ?: return emptyList()
+        val rawElements = mutableListOf<RawScreenElement>()
+        collectChatScreenElements(root, rawElements)
+
+        val bucketPx = rowDedupBucketPx()
+        val durationsOnScreen = rawElements.filter { it.type == "DURATION" && it.durationMs > 0L }
+        val messageElements = rawElements
+            .filter { it.type == "TEXT" || it.type == "AUDIO" }
+            .sortedBy { it.topY }
+            .distinctBy { "${it.type}_${it.topY / bucketPx}_${it.text.take(25)}" }
+
+        val maxDurDistancePx = (85f * densityScale()).toInt().coerceAtLeast(130)
+        var audioCounter = 0
+        return messageElements.map { raw ->
+            if (raw.type == "AUDIO") {
+                val idx = audioCounter
+                audioCounter++
+                val nearbyDuration = durationsOnScreen
+                    .minByOrNull { abs(it.topY - raw.topY) }
+                    ?.takeIf { abs(it.topY - raw.topY) < maxDurDistancePx }
+                    ?.durationMs
+                val finalDurationMs = when {
+                    raw.durationMs > 1000L -> raw.durationMs
+                    nearbyDuration != null && nearbyDuration > 1000L -> nearbyDuration
+                    else -> 6_000L
+                }
+                ScreenChatItem(
+                    isAudio = true,
+                    text = raw.text,
+                    topY = raw.topY,
+                    audioOrderInDay = idx,
+                    audioDurationMs = finalDurationMs,
+                    isOutgoing = raw.isOutgoing
+                )
+            } else {
+                ScreenChatItem(
+                    isAudio = false,
+                    text = raw.text,
+                    topY = raw.topY,
+                    audioOrderInDay = -1,
+                    audioDurationMs = 0L,
+                    isOutgoing = raw.isOutgoing
+                )
+            }
+        }
+    }
 
     private fun extractChatItemsByDayFromTree(
         root: AccessibilityNodeInfo,
@@ -882,7 +1013,8 @@ class JarvisAccessibilityService : AccessibilityService() {
                     text = raw.text,
                     topY = raw.topY,
                     audioOrderInDay = idx,
-                    audioDurationMs = finalDurationMs
+                    audioDurationMs = finalDurationMs,
+                    isOutgoing = raw.isOutgoing
                 )
             } else {
                 ScreenChatItem(
@@ -890,7 +1022,8 @@ class JarvisAccessibilityService : AccessibilityService() {
                     text = raw.text,
                     topY = raw.topY,
                     audioOrderInDay = -1,
-                    audioDurationMs = 0L
+                    audioDurationMs = 0L,
+                    isOutgoing = raw.isOutgoing
                 )
             }
         }
@@ -950,6 +1083,97 @@ class JarvisAccessibilityService : AccessibilityService() {
         val f4 = normalize(SimpleDateFormat("d/M", localeAr).format(d))
         val f5 = normalize(SimpleDateFormat("dd/MM", localeAr).format(d))
         return listOf(f1, f2, f3, f4, f5).filter { it.isNotEmpty() }
+    }
+
+    /**
+     * Detecta si un mensaje o audio de WhatsApp fue enviado por nosotros (burbuja a la derecha o con tildes ✓✓ de estado)
+     * para poder ignorarlo cuando el usuario pide "el último mensaje/audio de X".
+     */
+    private fun isOutgoingWhatsAppMessageNode(node: AccessibilityNodeInfo, nodeRect: Rect): Boolean {
+        val screenW = screenWidthPx()
+        if (screenW <= 0) return false
+
+        // 1. Buscamos el contenedor de la fila completa (hijo directo del RecyclerView)
+        // y el contenedor de la burbuja (el ancestro que no ocupa todo el ancho de la pantalla)
+        var current: AccessibilityNodeInfo? = node
+        var rowNode: AccessibilityNodeInfo? = null
+        var bubbleNode: AccessibilityNodeInfo? = null
+        var depth = 0
+
+        val maxBubbleWidth = (screenW * 0.92f).toInt()
+        val minBubbleWidth = (screenW * 0.15f).toInt()
+
+        while (current != null && depth < 8) {
+            val p = current.parent ?: break
+            val pRect = Rect()
+            p.getBoundsInScreen(pRect)
+
+            if (p.isScrollable) {
+                rowNode = current
+                break
+            }
+
+            if (pRect.width() in minBubbleWidth..maxBubbleWidth && pRect.height() > 15) {
+                bubbleNode = p
+            }
+
+            current = p
+            depth++
+        }
+
+        if (rowNode == null) {
+            rowNode = current
+        }
+
+        // 2. Si la fila completa contiene el ícono o texto de estado (tildes ✓✓ / entregado / leído), es 100% saliente (enviado por nosotros)
+        if (rowNode != null && hasOutgoingStatusTickRecursive(rowNode, maxDepth = 8)) {
+            return true
+        }
+
+        // 3. Si encontramos la burbuja del mensaje, comparamos sus márgenes izquierdo y derecho
+        if (bubbleNode != null) {
+            val bRect = Rect()
+            bubbleNode.getBoundsInScreen(bRect)
+            val leftMargin = bRect.left
+            val rightMargin = (screenW - bRect.right).coerceAtLeast(0)
+
+            // Burbuja alineada a la derecha: margen izquierdo significativamente mayor que el derecho
+            if (leftMargin > rightMargin + (20f * densityScale()).toInt()) {
+                return true
+            }
+            // En WhatsApp las burbujas enviadas tienen un margen izquierdo de al menos 18% del ancho de pantalla
+            if (leftMargin > (screenW * 0.18f).toInt() && rightMargin < (screenW * 0.15f).toInt()) {
+                return true
+            }
+            if (leftMargin < (screenW * 0.12f).toInt()) {
+                return false
+            }
+        }
+
+        // 4. Respaldo por la posición del nodo individual
+        return nodeRect.left > (screenW * 0.35f).toInt()
+    }
+
+    private fun hasOutgoingStatusTickRecursive(node: AccessibilityNodeInfo?, maxDepth: Int): Boolean {
+        if (node == null || maxDepth < 0) return false
+        val viewId = node.viewIdResourceName?.lowercase().orEmpty()
+        if (viewId.endsWith(":id/status") || viewId.endsWith(":id/status_icon") || viewId.endsWith(":id/msg_status")) {
+            return true
+        }
+
+        val desc = node.contentDescription?.toString()?.lowercase()?.trim().orEmpty()
+        if (desc == "leído" || desc == "leido" || desc == "entregado" || desc == "enviado" ||
+            desc == "read" || desc == "delivered" || desc == "sent" || desc == "pendiente" || desc == "pending"
+        ) {
+            return true
+        }
+
+        if (maxDepth == 0) return false
+        for (i in 0 until node.childCount) {
+            val child = node.getChild(i) ?: continue
+            if (hasOutgoingStatusTickRecursive(child, maxDepth - 1)) return true
+        }
+        return false
     }
 
     private fun collectChatScreenElements(
@@ -1021,14 +1245,16 @@ class JarvisAccessibilityService : AccessibilityService() {
 
             if (isAudioControl) {
                 val durFromDesc = parseAudioDurationTextMs(desc)
-                outList.add(RawScreenElement("AUDIO", "Audio de voz", rect.top, durFromDesc))
+                val outgoing = isOutgoingWhatsAppMessageNode(node, rect)
+                outList.add(RawScreenElement("AUDIO", "Audio de voz", rect.top, durFromDesc, outgoing))
                 return
             }
 
             val isMessageTextView = viewId.endsWith(":id/message_text") ||
                 viewId.endsWith(":id/caption")
             if (isMessageTextView && text.isNotEmpty() && !TIME_ONLY_MSG_REGEX.matches(text)) {
-                outList.add(RawScreenElement("TEXT", text, rect.top))
+                val outgoing = isOutgoingWhatsAppMessageNode(node, rect)
+                outList.add(RawScreenElement("TEXT", text, rect.top, 0L, outgoing))
                 return
             }
         }
@@ -1062,18 +1288,39 @@ class JarvisAccessibilityService : AccessibilityService() {
         return 0L
     }
 
-    fun clickLatestAudioInCurrentChatScreen(rootNode: AccessibilityNodeInfo? = rootInActiveWindow): Boolean {
+    fun clickLatestAudioInCurrentChatScreen(
+        rootNode: AccessibilityNodeInfo? = rootInActiveWindow,
+        fromBottomIndex: Int = 0,
+        onlyIncoming: Boolean = true
+    ): Boolean {
         val root = rootNode ?: return false
         val headers = mutableListOf<RawScreenElement>()
         val audioButtons = mutableListOf<Pair<Int, AccessibilityNodeInfo>>()
         collectHeadersAndAudioButtons(root, headers, audioButtons)
 
-        val latestButton = audioButtons.maxByOrNull { it.first }?.second ?: return false
-        val desc = latestButton.contentDescription?.toString()?.lowercase().orEmpty()
+        val bucketPx = rowDedupBucketPx()
+        val sortedButtons = audioButtons
+            .sortedBy { it.first }
+            .distinctBy { it.first / bucketPx }
+
+        val candidateButtons = if (onlyIncoming) {
+            sortedButtons.filter { (_, node) ->
+                val r = Rect()
+                node.getBoundsInScreen(r)
+                !isOutgoingWhatsAppMessageNode(node, r)
+            }
+        } else {
+            sortedButtons
+        }
+
+        if (candidateButtons.isEmpty()) return false
+        val targetIdx = (candidateButtons.lastIndex - fromBottomIndex).coerceIn(0, candidateButtons.lastIndex)
+        val chosenButton = candidateButtons[targetIdx].second
+        val desc = chosenButton.contentDescription?.toString()?.lowercase().orEmpty()
         if (desc.contains("paus")) return true
 
         lastVoiceNoteClickTime = System.currentTimeMillis()
-        return clickAudioNodeWithFallback(latestButton)
+        return clickAudioNodeWithFallback(chosenButton)
     }
 
     fun clickAudioInCurrentScreenByDayOrder(
@@ -1552,6 +1799,12 @@ class JarvisAccessibilityService : AccessibilityService() {
         private var onDayChatItemsReadyCallback: ((List<ScreenChatItem>) -> Unit)? = null
 
         @Volatile
+        private var autoInspectBottomRecentUntilTimestamp: Long = 0L
+
+        @Volatile
+        private var onBottomRecentItemsReadyCallback: ((List<ScreenChatItem>) -> Unit)? = null
+
+        @Volatile
         private var autoStartNativeMicUntilTimestamp: Long = 0L
 
         @Volatile
@@ -1621,7 +1874,31 @@ class JarvisAccessibilityService : AccessibilityService() {
             requestedDayFilter = cleanDay
             onDayChatItemsReadyCallback = onReady
             instance?.scrollAttemptsLeft = if (cleanDay == "hoy") 4 else 10
+            instance?.scrollDownPagesLeft = 12
             autoInspectDayChatUntilTimestamp = System.currentTimeMillis() + 18_000L
+            instance?.mainHandler?.postDelayed({
+                if (autoInspectDayChatUntilTimestamp > 0L) {
+                    val root = instance?.rootInActiveWindow ?: return@postDelayed
+                    instance?.processOpenChatForRequestedDay(root)
+                }
+            }, 600L)
+        }
+
+        fun requestInspectBottomChatItems(onReady: (List<ScreenChatItem>) -> Unit) {
+            onBottomRecentItemsReadyCallback = onReady
+            autoInspectBottomRecentUntilTimestamp = System.currentTimeMillis() + 12_000L
+            instance?.mainHandler?.postDelayed({
+                if (autoInspectBottomRecentUntilTimestamp > 0L) {
+                    val root = instance?.rootInActiveWindow ?: return@postDelayed
+                    val items = instance?.extractAllVisibleChatItemsFromCurrentScreen(root).orEmpty()
+                    if (items.isNotEmpty()) {
+                        autoInspectBottomRecentUntilTimestamp = 0L
+                        val cb = onBottomRecentItemsReadyCallback
+                        onBottomRecentItemsReadyCallback = null
+                        cb?.invoke(items)
+                    }
+                }
+            }, 600L)
         }
 
         fun requestAutoPlayInYouTube() {

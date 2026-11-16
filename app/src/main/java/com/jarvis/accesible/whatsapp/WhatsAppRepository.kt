@@ -72,6 +72,7 @@ object WhatsAppRepository {
     }
 
     private var activeQueue: List<UnifiedChatEntry> = emptyList()
+    private var lastLoadedScreenItems: List<ScreenChatItem> = emptyList()
     private val alreadyReadTextsInCurrentDay = mutableSetOf<String>()
 
     @Volatile
@@ -333,54 +334,132 @@ object WhatsAppRepository {
 
     /**
      * Cuando el usuario dice "Reproducilo", "Escuchalo" o "Reproducí el último audio":
-     * Reproduce ÚNICAMENTE ese último audio recibido (sin ir al primer audio del día).
+     * Reproduce ÚNICAMENTE ese último audio recibido de la otra persona (ignorando los enviados por nosotros).
      */
     fun playLatestSingleAudioOnly(
         context: Context,
         senderHint: String?,
         speakCallback: (String, (() -> Unit)?) -> Unit
     ) {
+        playRecentIncomingFromContact(
+            context = context,
+            senderHint = senderHint,
+            onlyAudio = true,
+            count = 1,
+            isPenultimate = false,
+            speakCallback = speakCallback
+        )
+    }
+
+    /**
+     * Lee o reproduce el último, anteúltimo o últimos N mensajes/audios enviados por la otra persona
+     * (ignorando siempre los mensajes o audios enviados por nosotros).
+     */
+    fun playRecentIncomingFromContact(
+        context: Context,
+        senderHint: String?,
+        onlyAudio: Boolean,
+        count: Int = 1,
+        isPenultimate: Boolean = false,
+        speakCallback: (String, (() -> Unit)?) -> Unit
+    ) {
+        ensureHistoryLoaded(context)
         stopAudioPlayback()
         autoAdvanceGeneration++
-
-        val recentFile = findLatestWhatsAppVoiceNoteFile(maxAgeMillis = 900_000L)
-        if (recentFile != null && senderHint.isNullOrBlank()) {
-            playSingleAudioFile(recentFile) { ok, err ->
-                if (!ok && err.isNotBlank()) speakCallback(err, null)
-            }
-            return
-        }
+        activeQueueContactName = null
 
         val targetPerson = senderHint?.takeIf { it.isNotBlank() } ?: lastOpenedContactName
+
+        val handleExtractedScreenItems: (List<ScreenChatItem>, String) -> Unit = { screenItems, displayPerson ->
+            // Filtramos estrictamente los recibidos de la otra persona (!it.isOutgoing)
+            val incomingOnly = screenItems.filter { !it.isOutgoing && (!onlyAudio || it.isAudio) }
+            val selectedItems = when {
+                incomingOnly.isEmpty() -> emptyList()
+                isPenultimate -> {
+                    if (incomingOnly.size >= 2) {
+                        listOf(incomingOnly[incomingOnly.size - 2])
+                    } else {
+                        listOf(incomingOnly.last())
+                    }
+                }
+                else -> incomingOnly.takeLast(count.coerceIn(1, 10))
+            }
+
+            if (selectedItems.isNotEmpty()) {
+                lastLoadedScreenItems = selectedItems
+                activeQueueContactName = null // No scrollear hacia abajo al terminar estos mensajes puntuales
+                activeQueue = mapScreenItemsToEntries(selectedItems, "hoy")
+                activeQueueIndex = 0
+                playCurrentQueueEntryAndAutoAdvance(context, speakCallback)
+            } else {
+                // Respaldo con notificaciones guardadas de esa persona
+                val saved = buildSavedEntriesForPersonAndDay(displayPerson, "hoy")
+                    .let { list -> if (onlyAudio) list.filter { it.isAudio } else list }
+                val fallbackSelected = when {
+                    saved.isEmpty() -> emptyList()
+                    isPenultimate -> if (saved.size >= 2) listOf(saved[saved.size - 2]) else listOf(saved.last())
+                    else -> saved.takeLast(count.coerceIn(1, 10))
+                }
+                if (fallbackSelected.isNotEmpty()) {
+                    activeQueueContactName = null
+                    activeQueue = fallbackSelected
+                    activeQueueIndex = 0
+                    playCurrentQueueEntryAndAutoAdvance(context, speakCallback)
+                } else {
+                    val label = if (onlyAudio) "audios" else "mensajes"
+                    speakCallback("No encontré $label recientes de $displayPerson.", null)
+                }
+            }
+        }
+
         if (!targetPerson.isNullOrBlank()) {
             val contact = findContactByName(context, targetPerson)
+            val resolvedName = contact?.first ?: targetPerson
+            lastOpenedContactName = resolvedName
+
             if (contact != null) {
-                lastOpenedContactName = contact.first
-                JarvisAccessibilityService.requestPlayLatestSingleAudioInOpenChat()
+                JarvisAccessibilityService.requestInspectBottomChatItems { items ->
+                    handleExtractedScreenItems(items, resolvedName)
+                }
                 openWhatsAppChatByPhone(context, contact.second)
                 return
             } else {
-                lastOpenedContactName = targetPerson
                 JarvisAccessibilityService.requestSearchAndOpenChatInWhatsApp(targetPerson) {
-                    JarvisAccessibilityService.requestPlayLatestSingleAudioInOpenChat()
+                    JarvisAccessibilityService.requestInspectBottomChatItems { items ->
+                        handleExtractedScreenItems(items, resolvedName)
+                    }
                 }
                 launchWhatsAppHome(context)
                 return
             }
         }
 
-        // Si el chat ya está abierto en pantalla o hay archivos .opus locales, reproducimos solo el último
-        val clickedOnScreen = JarvisAccessibilityService.instance?.clickLatestAudioInCurrentChatScreen() ?: false
-        if (clickedOnScreen) return
-
-        val lastOpus = getRecentOpusFilesNewestFirst(limit = 1).firstOrNull()
-        if (lastOpus != null) {
-            playSingleAudioFile(lastOpus) { ok, err ->
-                if (!ok && err.isNotBlank()) speakCallback(err, null)
-            }
-        } else {
-            speakCallback("No encontré el audio para reproducir.", null)
+        // Si no especificó contacto y ya hay un chat abierto en pantalla
+        val currentScreenItems = JarvisAccessibilityService.instance?.extractAllVisibleChatItemsFromCurrentScreen().orEmpty()
+        if (currentScreenItems.isNotEmpty()) {
+            handleExtractedScreenItems(currentScreenItems, "este chat")
+            return
         }
+
+        if (onlyAudio) {
+            val fromIndex = if (isPenultimate) 1 else 0
+            val clickedOnScreen = JarvisAccessibilityService.instance?.clickLatestAudioInCurrentChatScreen(
+                fromBottomIndex = fromIndex,
+                onlyIncoming = true
+            ) ?: false
+            if (clickedOnScreen) return
+
+            val recentOpusList = getRecentOpusFilesNewestFirst(limit = 4)
+            val chosenOpus = if (isPenultimate && recentOpusList.size >= 2) recentOpusList[1] else recentOpusList.firstOrNull()
+            if (chosenOpus != null) {
+                playSingleAudioFile(chosenOpus) { ok, err ->
+                    if (!ok && err.isNotBlank()) speakCallback(err, null)
+                }
+                return
+            }
+        }
+
+        speakCallback("Decime de qué persona querés escuchar el mensaje.", null)
     }
 
     fun openContactChatOnly(context: Context, personQuery: String): String {
@@ -412,8 +491,9 @@ object WhatsAppRepository {
 
     /**
      * MODO HISTORIAL POR DÍA ("Leeme los mensajes de hoy/ayer/viernes de X"):
-     * Sube hasta el cartel de ese día para arrancar SIEMPRE desde el primer mensaje de ese día hasta el último,
-     * y si el día es largo, baja con scroll automáticamente para seguir leyendo hasta terminar ese día.
+     * Sube hasta el cartel de ese día para arrancar SIEMPRE desde el primer mensaje de ese día hasta el último
+     * (leyendo y reproduciendo los de ambos para seguir el hilo de la conversación),
+     * y cuando llega al último mensaje del día termina sin entrar en bucle.
      */
     fun startDayChatPlaybackFromFirstToLast(
         context: Context,
@@ -426,6 +506,7 @@ object WhatsAppRepository {
         stopAudioPlayback()
         autoAdvanceGeneration++
         alreadyReadTextsInCurrentDay.clear()
+        lastLoadedScreenItems = emptyList()
 
         val dayFilter = dayFilterRaw?.ifBlank { "hoy" } ?: "hoy"
         val targetPerson = senderQuery?.takeIf { it.isNotBlank() } ?: lastOpenedContactName
@@ -441,12 +522,14 @@ object WhatsAppRepository {
             val onChatReadyToInspect = {
                 JarvisAccessibilityService.requestInspectOpenChatForDay(dayFilter) { screenItems ->
                     if (screenItems.isNotEmpty()) {
+                        lastLoadedScreenItems = screenItems
                         activeQueue = mapScreenItemsToEntries(screenItems, dayFilter)
                         activeQueueIndex = 0
                         playCurrentQueueEntryAndAutoAdvance(context, speakCallback)
                     } else {
                         val fallbackEntries = buildSavedEntriesForPersonAndDay(resolvedDisplayName, dayFilter)
                         if (fallbackEntries.isNotEmpty()) {
+                            activeQueueContactName = null
                             activeQueue = fallbackEntries
                             activeQueueIndex = 0
                             playCurrentQueueEntryAndAutoAdvance(context, speakCallback)
@@ -485,9 +568,10 @@ object WhatsAppRepository {
         return screenItems.map { item ->
             if (!item.isAudio) {
                 alreadyReadTextsInCurrentDay.add(item.text)
+                val spoken = if (item.isOutgoing) "Vos: ${item.text}" else item.text
                 UnifiedChatEntry(
                     isAudio = false,
-                    spokenText = item.text,
+                    spokenText = spoken,
                     screenTopY = item.topY,
                     audioDurationMs = 0L,
                     dayFilter = dayFilter
@@ -596,27 +680,37 @@ object WhatsAppRepository {
         // Llegamos al último mensaje visible en pantalla: si el día es largo, probamos bajar con scroll para ver si siguen más mensajes de ese día
         val service = JarvisAccessibilityService.instance
         if (service != null && !activeQueueContactName.isNullOrBlank()) {
-            service.scrollDownForMoreItemsInSameDay(activeQueueDayFilter, alreadyReadTextsInCurrentDay) { moreScreenItems ->
+            service.scrollDownForMoreItemsInSameDay(
+                dayFilterRaw = activeQueueDayFilter,
+                previousScreenItems = lastLoadedScreenItems,
+                alreadyReadTexts = alreadyReadTextsInCurrentDay
+            ) { moreScreenItems ->
                 if (moreScreenItems.isNotEmpty()) {
+                    lastLoadedScreenItems = moreScreenItems
                     activeQueue = mapScreenItemsToEntries(moreScreenItems, activeQueueDayFilter)
                     activeQueueIndex = 0
                     playCurrentQueueEntryAndAutoAdvance(context, speakCallback)
                 } else {
-                    notifyEndOfDayReached()
+                    notifyEndOfDayReached(speakCallback)
                 }
             }
         } else {
-            notifyEndOfDayReached()
+            notifyEndOfDayReached(speakCallback)
         }
     }
 
-    private fun notifyEndOfDayReached() {
+    private fun notifyEndOfDayReached(speakCallback: ((String, (() -> Unit)?) -> Unit)? = null) {
         val finishedDay = activeQueueDayFilter
         val contact = activeQueueContactName
+        activeQueueContactName = null
+        lastLoadedScreenItems = emptyList()
         if (finishedDay != "hoy" && !contact.isNullOrBlank() && onPastDayFinishedCallback != null) {
             val cb = onPastDayFinishedCallback
             onPastDayFinishedCallback = null
             cb?.invoke(contact, finishedDay)
+        } else if (!contact.isNullOrBlank()) {
+            val msg = if (finishedDay == "hoy") "Ese fue el último mensaje de hoy." else "Ese fue el último mensaje de $finishedDay."
+            speakCallback?.invoke(msg, null)
         }
     }
 
@@ -692,12 +786,18 @@ object WhatsAppRepository {
             if (activeQueueIndex + 1 > activeQueue.lastIndex) {
                 val service = JarvisAccessibilityService.instance
                 if (service != null && !activeQueueContactName.isNullOrBlank()) {
-                    service.scrollDownForMoreItemsInSameDay(activeQueueDayFilter, alreadyReadTextsInCurrentDay) { moreScreenItems ->
+                    service.scrollDownForMoreItemsInSameDay(
+                        dayFilterRaw = activeQueueDayFilter,
+                        previousScreenItems = lastLoadedScreenItems,
+                        alreadyReadTexts = alreadyReadTextsInCurrentDay
+                    ) { moreScreenItems ->
                         if (moreScreenItems.isNotEmpty()) {
+                            lastLoadedScreenItems = moreScreenItems
                             activeQueue = mapScreenItemsToEntries(moreScreenItems, activeQueueDayFilter)
                             activeQueueIndex = 0
                             playCurrentQueueEntryAndAutoAdvance(context, speakCallback)
                         } else {
+                            activeQueueContactName = null
                             speakCallback("Ese fue el último mensaje.", null)
                         }
                     }

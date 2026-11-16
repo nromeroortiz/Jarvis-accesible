@@ -24,6 +24,12 @@ sealed class AgentDecision {
     data class CheckWeather(val rawQuery: String) : AgentDecision()
     data class CheckUnreadWhatsApp(val dummy: Boolean = true) : AgentDecision()
     data class PlayLatestSingleVoiceNote(val senderName: String? = null) : AgentDecision()
+    data class PlayRecentIncomingMessages(
+        val senderName: String? = null,
+        val onlyAudio: Boolean = false,
+        val count: Int = 1,
+        val isPenultimate: Boolean = false
+    ) : AgentDecision()
     data class OpenWhatsAppChatAndAskDay(val senderName: String) : AgentDecision()
     data class StartUnifiedDayChatPlayback(
         val senderName: String?,
@@ -501,7 +507,9 @@ class GeminiAgent(private val context: Context) {
             norm.contains("chat") ||
             norm.contains("whatsapp") ||
             norm.contains("escribio") ||
-            norm.contains("mando")
+            norm.contains("mando") ||
+            norm.contains("dijo") ||
+            norm.contains("lo ultimo")
 
         if (mentionsWhatsAppContent) {
             // A) ¿Preguntó "¿tengo mensajes?" / "¿hay algún mensaje?"? -> Lee o reproduce directamente los mensajes/audios nuevos
@@ -520,9 +528,36 @@ class GeminiAgent(private val context: Context) {
 
             val contact = extractContactFromCommand(rawText, norm)
 
-            // B) ¿Pidió específicamente "el último audio de X"? -> Reproduce solo ese último audio
-            if (hasAudioWord && norm.contains("ultimo")) {
-                return AgentDecision.PlayLatestSingleVoiceNote(senderName = contact)
+            // B) ¿Pidió "el último mensaje/audio", "anteúltimo", "últimos 3", "lo que me mandó/dijo"?
+            // -> Reproduce o lee ÚNICAMENTE los recibidos de la otra persona (ignorando los nuestros)
+            val isRecentIncomingQuery = norm.contains("ultimo") ||
+                norm.contains("anteultimo") ||
+                norm.contains("penultimo") ||
+                norm.contains("lo ultimo") ||
+                norm.contains("lo que me mando") ||
+                norm.contains("lo que me dijo") ||
+                norm.contains("que me mando") ||
+                norm.contains("que me dijo")
+
+            if (isRecentIncomingQuery) {
+                val isOnlyAudio = hasAudioWord && !norm.contains("mensaje") && !norm.contains("texto")
+                val isPenultimate = norm.contains("anteultimo") || norm.contains("penultimo")
+                val countMatch = Regex("ultim[oa]s?\\s+(\\d+)").find(norm)
+                val count = when {
+                    countMatch != null -> countMatch.groupValues[1].toIntOrNull()?.coerceIn(1, 10) ?: 1
+                    norm.contains("ultimos dos") || norm.contains("ultimas dos") -> 2
+                    norm.contains("ultimos tres") || norm.contains("ultimas tres") -> 3
+                    norm.contains("ultimos cuatro") || norm.contains("ultimas cuatro") -> 4
+                    norm.contains("ultimos cinco") || norm.contains("ultimas cinco") -> 5
+                    norm.contains("ultimos mensajes") || norm.contains("ultimos audios") || norm.contains("ultimas notas") -> 3
+                    else -> 1
+                }
+                return AgentDecision.PlayRecentIncomingMessages(
+                    senderName = contact,
+                    onlyAudio = isOnlyAudio,
+                    count = count,
+                    isPenultimate = isPenultimate
+                )
             }
 
             // C) Si pidió leer/reproducir el chat/mensajes/audios de un día ("hoy", "ayer", "viernes") o de una persona
@@ -534,7 +569,7 @@ class GeminiAgent(private val context: Context) {
             }
 
             if (hasAudioWord) {
-                return AgentDecision.PlayLatestSingleVoiceNote(senderName = null)
+                return AgentDecision.PlayRecentIncomingMessages(senderName = null, onlyAudio = true, count = 1)
             }
 
             return AgentDecision.CheckUnreadWhatsApp()
@@ -621,7 +656,7 @@ class GeminiAgent(private val context: Context) {
         val patterns = listOf(
             Regex("(?:enviale|enviarle|envia|enviar|mandale|mandar|manda|grabale|grabar|graba)\\s+(?:un\\s+)?(?:audio|mensaje de voz|nota de voz|mensaje|texto|whatsapp)\\s+(?:a|para)\\s+([a-zA-Z0-9áéíóúÁÉÍÓÚñÑ ]+)"),
             Regex("(?:contestale a|contestar a|respondele a|responder a|enviale a|enviarle a|mandale a|grabale a|grabar audio para|audio a|audio para|mensaje a|mensaje para|whatsapp a|escribile a|decile a)\\s+([a-zA-Z0-9áéíóúÁÉÍÓÚñÑ ]+)"),
-            Regex("(?:chat de|chat con|conversacion con|audios? de|mensajes? de|escribio|mando)\\s+([a-zA-Z0-9áéíóúÁÉÍÓÚñÑ ]+)"),
+            Regex("(?:chat de|chat con|conversacion con|audios? de|mensajes? de|lo ultimo de|lo de|escribio|mando|dijo)\\s+([a-zA-Z0-9áéíóúÁÉÍÓÚñÑ ]+)"),
             Regex("(?:llama a|llamar a|comunicame con|hablar con)\\s+([a-zA-Z0-9áéíóúÁÉÍÓÚñÑ ]+)")
         )
         for (regex in patterns) {
