@@ -169,7 +169,7 @@ class JarvisAccessibilityService : AccessibilityService() {
                     autoClickSendUntilTimestamp = 0L
                     pendingSendRecipientName = null
                     mainHandler.postDelayed({
-                        returnToHomeScreen()
+                        performGlobalAction(GLOBAL_ACTION_BACK)
                     }, 2200L)
                 } else if (!pendingSendRecipientName.isNullOrBlank()) {
                     val recipient = pendingSendRecipientName!!
@@ -244,6 +244,8 @@ class JarvisAccessibilityService : AccessibilityService() {
                     val runnable = Runnable {
                         pendingChatInspectRunnable = null
                         val freshRoot = rootInActiveWindow ?: return@Runnable
+                        val freshPkg = freshRoot.packageName?.toString().orEmpty()
+                        if (!freshPkg.startsWith("com.whatsapp")) return@Runnable
                         val items = extractAllVisibleChatItemsFromCurrentScreen(freshRoot)
                         if (items.isNotEmpty()) {
                             autoInspectBottomRecentUntilTimestamp = 0L
@@ -573,9 +575,6 @@ class JarvisAccessibilityService : AccessibilityService() {
                 }
             }, 350L)
         }
-        mainHandler.postDelayed({
-            returnToHomeScreen()
-        }, 1800L)
         cb?.invoke("Audio enviado.")
     }
 
@@ -745,12 +744,18 @@ class JarvisAccessibilityService : AccessibilityService() {
     }
 
     private fun processOpenChatForRequestedDay(root: AccessibilityNodeInfo) {
+        val pkg = root.packageName?.toString().orEmpty()
+        if (!pkg.startsWith("com.whatsapp")) return
+
         val targetDay = normalize(requestedDayFilter ?: "hoy")
         val extracted = extractChatItemsByDayFromTree(root, targetDay)
 
+        // Si el usuario pidió un día anterior ("ayer", "viernes", etc.) y aún no encontramos su cartel de inicio,
+        // subimos haciendo scroll hacia atrás. Si pidió "hoy", WhatsApp ya abre al fondo en los mensajes de hoy.
         val alreadyAboveToday = targetDay == "hoy" && extracted.sawOlderHeaderOnScreen
         val needsScrollUpToFindStartOfDay = !extracted.sawExactDayHeaderBanner &&
             !alreadyAboveToday &&
+            targetDay != "hoy" &&
             scrollAttemptsLeft > 0
 
         if (needsScrollUpToFindStartOfDay) {
@@ -779,6 +784,11 @@ class JarvisAccessibilityService : AccessibilityService() {
                 }, 480L)
                 return
             }
+        }
+
+        // Si todavía no hay items y WhatsApp aún está abriendo la conversación, permitimos más reintentos
+        if (extracted.items.isEmpty() && autoInspectDayChatUntilTimestamp > System.currentTimeMillis() + 1500L) {
+            return
         }
 
         deliverExtractedDayItems(extracted.items)
@@ -894,6 +904,9 @@ class JarvisAccessibilityService : AccessibilityService() {
         rootNode: AccessibilityNodeInfo? = rootInActiveWindow
     ): List<ScreenChatItem> {
         val root = rootNode ?: return emptyList()
+        val pkg = root.packageName?.toString().orEmpty()
+        if (!pkg.startsWith("com.whatsapp")) return emptyList()
+
         val rawElements = mutableListOf<RawScreenElement>()
         collectChatScreenElements(root, rawElements)
 
@@ -980,20 +993,21 @@ class JarvisAccessibilityService : AccessibilityService() {
             }
         }
 
-        if (!sawRequestedHeader && matchingItems.isEmpty() && (scrollAttemptsLeft <= 0 || allowWithoutBannerIfContinuing || (targetDayNorm == "hoy" && sawOlderHeader))) {
-            if (headers.isEmpty()) {
-                if (targetDayNorm == "hoy" || allowWithoutBannerIfContinuing) {
-                    matchingItems.addAll(mainElements.filter { it.type != "HEADER" })
-                }
-            } else {
-                val firstH = headers.first()
-                val firstHNorm = normalize(firstH.text)
-                if (targetDayNorm == "ayer" && headerMatchesDay(firstHNorm, "hoy")) {
-                    matchingItems.addAll(mainElements.filter { it.type != "HEADER" && it.topY < firstH.topY })
-                } else if (targetDayNorm == "hoy" && !headerMatchesDay(firstHNorm, "hoy")) {
-                    val lastH = headers.last()
-                    if (headerMatchesDay(normalize(lastH.text), "hoy")) {
-                        matchingItems.addAll(mainElements.filter { it.type != "HEADER" && it.topY > lastH.topY })
+        if (!sawRequestedHeader && matchingItems.isEmpty()) {
+            if (targetDayNorm == "hoy" || scrollAttemptsLeft <= 0 || allowWithoutBannerIfContinuing || sawOlderHeader) {
+                if (headers.isEmpty()) {
+                    if (targetDayNorm == "hoy" || allowWithoutBannerIfContinuing) {
+                        matchingItems.addAll(mainElements.filter { it.type != "HEADER" })
+                    }
+                } else {
+                    val firstH = headers.first()
+                    val firstHNorm = normalize(firstH.text)
+                    if (targetDayNorm == "ayer" && headerMatchesDay(firstHNorm, "hoy")) {
+                        matchingItems.addAll(mainElements.filter { it.type != "HEADER" && it.topY < firstH.topY })
+                    } else if (targetDayNorm == "hoy") {
+                        val lastH = headers.last()
+                        val afterLast = mainElements.filter { it.type != "HEADER" && it.topY > lastH.topY }
+                        matchingItems.addAll(afterLast.ifEmpty { mainElements.filter { it.type != "HEADER" } })
                     }
                 }
             }
@@ -1101,79 +1115,57 @@ class JarvisAccessibilityService : AccessibilityService() {
         val screenW = screenWidthPx()
         if (screenW <= 0) return false
 
-        // 1. Verificación definitiva por tildes de estado de mensaje saliente:
-        // En WhatsApp, SOLO los mensajes enviados por nosotros tienen tilde/estado (status/read/delivered/sent/pending).
-        // Los mensajes entrantes de la otra persona NUNCA tienen tildes de envío.
-        if (hasOutgoingStatusTickInBubbleOrAncestors(node)) {
+        // 1. Verificación geométrica directa del elemento (texto o botón de reproducir/pausar audio):
+        // En WhatsApp (LTR), cualquier elemento entrante de la otra persona está anclado a la izquierda (< 26% del ancho de pantalla).
+        if (nodeRect.left < (screenW * 0.26f).toInt()) {
+            return false
+        }
+
+        // Cualquier elemento saliente (enviado por nosotros) está desplazado hacia la derecha (>= 40% del ancho).
+        if (nodeRect.left >= (screenW * 0.40f).toInt()) {
             return true
         }
 
-        // 2. Buscamos el contenedor de la burbuja (subiendo en la jerarquía hasta 4 niveles)
-        var bubbleRect = nodeRect
+        // 2. Para elementos intermedios (burbujas muy anchas o centradas),
+        // inspeccionamos la burbuja contenedora inmediata (máximo 2 niveles arriba).
+        // NUNCA subir hasta el RecyclerView o ListView para no evaluar los demás mensajes del chat.
+        val maxBubbleHeight = (screenHeightPx() * 0.35f).toInt()
         var current: AccessibilityNodeInfo? = node
         var depth = 0
-        while (current != null && depth < 4) {
+        while (current != null && depth < 2) {
             val p = current.parent ?: break
-            val pRect = Rect()
-            p.getBoundsInScreen(pRect)
-            // Si el contenedor tiene un tamaño razonable de burbuja
-            if (pRect.width() in 40..(screenW * 0.98f).toInt() && pRect.height() < (screenHeightPx() * 0.50f).toInt()) {
-                bubbleRect = pRect
-                if (hasOutgoingStatusTickInBubble(p)) {
-                    return true
-                }
+            val pClass = p.className?.toString().orEmpty()
+            if (p.isScrollable || pClass.contains("RecyclerView") || pClass.contains("ListView") || pClass.contains("AbsListView")) {
                 break
             }
+            val pRect = Rect()
+            p.getBoundsInScreen(pRect)
+            if (pRect.height() > maxBubbleHeight) {
+                break
+            }
+
+            if (hasOutgoingStatusTickInBubble(p)) {
+                return true
+            }
+
+            val leftMargin = pRect.left
+            val rightMargin = screenW - pRect.right
+            if (leftMargin < (screenW * 0.18f).toInt() && rightMargin >= (screenW * 0.08f).toInt()) {
+                return false
+            }
+            if (rightMargin < (screenW * 0.15f).toInt() && leftMargin >= (screenW * 0.18f).toInt()) {
+                return true
+            }
+
             current = p
             depth++
         }
 
-        // 3. Regla geométrica basada en el contenedor de la burbuja:
-        // En WhatsApp (LTR):
-        // Una burbuja entrante está anclada a la izquierda:
-        // su borde izquierdo está cerca del margen izquierdo (left < 18% del ancho)
-        // y deja un margen libre grande a la derecha (rightMargin >= 8% del ancho).
-        val leftRatio = bubbleRect.left.toFloat() / screenW
-        val rightMarginRatio = (screenW - bubbleRect.right).toFloat() / screenW
-
-        if (leftRatio < 0.18f && rightMarginRatio >= 0.08f) {
-            return false // 100% entrante de la otra persona
-        }
-
-        // Una burbuja saliente está anclada a la derecha:
-        // su borde derecho está cerca del margen derecho (rightMargin < 14%)
-        // y su borde izquierdo está desplazado hacia la derecha (leftRatio >= 18%).
-        if (rightMarginRatio < 0.14f && leftRatio >= 0.18f) {
-            return true // 100% saliente enviada por nosotros
-        }
-
-        // 4. Si la burbuja entera no se pudo aislar, comprobamos la posición de la vista:
-        // Si el elemento está en la mitad izquierda (< 30% del ancho), es entrante
-        if (nodeRect.left < (screenW * 0.30f).toInt()) {
-            return false
-        }
-
-        // Si está en la mitad derecha (>= 45%), es saliente
-        if (nodeRect.left >= (screenW * 0.45f).toInt()) {
-            return true
-        }
-
-        return false
-    }
-
-    private fun hasOutgoingStatusTickInBubbleOrAncestors(node: AccessibilityNodeInfo): Boolean {
-        var curr: AccessibilityNodeInfo? = node
-        var depth = 0
-        while (curr != null && depth < 4) {
-            if (hasOutgoingStatusTickInBubble(curr)) return true
-            curr = curr.parent
-            depth++
-        }
         return false
     }
 
     private fun hasOutgoingStatusTickInBubble(bubbleNode: AccessibilityNodeInfo?): Boolean {
-        if (bubbleNode == null) return false
+        if (bubbleNode == null || bubbleNode.childCount > 10) return false
         val viewId = bubbleNode.viewIdResourceName?.lowercase().orEmpty()
         if (viewId.endsWith(":id/status") || viewId.endsWith(":id/status_icon") || viewId.endsWith(":id/msg_status")) {
             return true
@@ -1909,35 +1901,56 @@ class JarvisAccessibilityService : AccessibilityService() {
             val cleanDay = dayFilter.ifBlank { "hoy" }.lowercase().trim()
             requestedDayFilter = cleanDay
             onDayChatItemsReadyCallback = onReady
-            instance?.scrollAttemptsLeft = if (cleanDay == "hoy") 4 else 10
+            instance?.scrollAttemptsLeft = if (cleanDay == "hoy") 0 else 8
             instance?.scrollDownPagesLeft = 12
             autoInspectDayChatUntilTimestamp = System.currentTimeMillis() + 18_000L
+            val delays = listOf(600L, 1100L, 1700L, 2500L, 3500L, 5000L)
+            for (delay in delays) {
+                instance?.mainHandler?.postDelayed({
+                    if (autoInspectDayChatUntilTimestamp > 0L) {
+                        val root = instance?.rootInActiveWindow ?: return@postDelayed
+                        val pkg = root.packageName?.toString().orEmpty()
+                        if (pkg.startsWith("com.whatsapp")) {
+                            instance?.processOpenChatForRequestedDay(root)
+                        }
+                    }
+                }, delay)
+            }
+            // Salvaguarda final a los 8000ms si no se completó antes
             instance?.mainHandler?.postDelayed({
                 if (autoInspectDayChatUntilTimestamp > 0L) {
-                    val root = instance?.rootInActiveWindow ?: return@postDelayed
-                    instance?.processOpenChatForRequestedDay(root)
+                    autoInspectDayChatUntilTimestamp = 0L
+                    val cb = onDayChatItemsReadyCallback
+                    onDayChatItemsReadyCallback = null
+                    val root = instance?.rootInActiveWindow
+                    val items = if (root != null) instance?.extractAllVisibleChatItemsFromCurrentScreen(root).orEmpty() else emptyList()
+                    cb?.invoke(items)
                 }
-            }, 600L)
+            }, 8000L)
         }
 
         fun requestInspectBottomChatItems(onReady: (List<ScreenChatItem>) -> Unit) {
             onBottomRecentItemsReadyCallback = onReady
             autoInspectBottomRecentUntilTimestamp = System.currentTimeMillis() + 12_000L
-            for (delay in listOf(500L, 900L, 1400L)) {
+            val delays = listOf(500L, 900L, 1400L, 2000L, 2800L, 3800L, 5000L)
+            for (delay in delays) {
                 instance?.mainHandler?.postDelayed({
                     if (autoInspectBottomRecentUntilTimestamp > 0L) {
                         val root = instance?.rootInActiveWindow ?: return@postDelayed
-                        val items = instance?.extractAllVisibleChatItemsFromCurrentScreen(root).orEmpty()
-                        if (items.isNotEmpty() && autoInspectBottomRecentUntilTimestamp > 0L) {
-                            autoInspectBottomRecentUntilTimestamp = 0L
-                            val cb = onBottomRecentItemsReadyCallback
-                            onBottomRecentItemsReadyCallback = null
-                            cb?.invoke(items)
+                        val pkg = root.packageName?.toString().orEmpty()
+                        if (pkg.startsWith("com.whatsapp")) {
+                            val items = instance?.extractAllVisibleChatItemsFromCurrentScreen(root).orEmpty()
+                            if (items.isNotEmpty() && autoInspectBottomRecentUntilTimestamp > 0L) {
+                                autoInspectBottomRecentUntilTimestamp = 0L
+                                val cb = onBottomRecentItemsReadyCallback
+                                onBottomRecentItemsReadyCallback = null
+                                cb?.invoke(items)
+                            }
                         }
                     }
                 }, delay)
             }
-            // Salvaguarda si pasaron 2800ms y no se detectaron elementos visibles
+            // Salvaguarda final a los 7500ms
             instance?.mainHandler?.postDelayed({
                 if (autoInspectBottomRecentUntilTimestamp > 0L) {
                     autoInspectBottomRecentUntilTimestamp = 0L
@@ -1947,25 +1960,11 @@ class JarvisAccessibilityService : AccessibilityService() {
                     val items = if (root != null) instance?.extractAllVisibleChatItemsFromCurrentScreen(root).orEmpty() else emptyList()
                     cb?.invoke(items)
                 }
-            }, 2800L)
+            }, 7500L)
         }
 
         fun returnToHomeScreen(context: android.content.Context? = null) {
-            val serv = instance
-            if (serv != null) {
-                serv.mainHandler.postDelayed({
-                    serv.performGlobalAction(AccessibilityService.GLOBAL_ACTION_HOME)
-                }, 550L)
-            } else if (context != null) {
-                try {
-                    val homeIntent = android.content.Intent(android.content.Intent.ACTION_MAIN).apply {
-                        addCategory(android.content.Intent.CATEGORY_HOME)
-                        addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
-                    }
-                    context.startActivity(homeIntent)
-                } catch (_: Exception) {
-                }
-            }
+            // Desactivado a pedido del usuario: no forzar regreso al inicio al terminar tareas
         }
 
         fun requestAutoPlayInYouTube() {

@@ -297,9 +297,7 @@ object WhatsAppRepository {
         // Mensajes no leídos ordenados cronológicamente del más viejo al más nuevo
         val unread = messages.filter { !it.isReadByUncle }.sortedBy { it.timestamp }
         if (unread.isEmpty()) {
-            speakCallback("No tenés mensajes nuevos.") {
-                JarvisAccessibilityService.returnToHomeScreen(context)
-            }
+            speakCallback("No tenés mensajes nuevos.", null)
             return
         }
 
@@ -351,7 +349,6 @@ object WhatsAppRepository {
         if (gen != autoAdvanceGeneration) return
 
         if (index !in queue.indices) {
-            JarvisAccessibilityService.returnToHomeScreen(context)
             return
         }
 
@@ -398,8 +395,6 @@ object WhatsAppRepository {
                                 playUnreadQueueStep(context, queue, index + 1, gen, speakCallback)
                             }
                         }, 220L)
-                    } else {
-                        JarvisAccessibilityService.returnToHomeScreen(context)
                     }
                 }
             }
@@ -443,22 +438,14 @@ object WhatsAppRepository {
                         ?: findLatestWhatsAppVoiceNoteFile(maxAgeMillis = 600_000L)
                     speakCallback("$resolvedName mandó un audio.") {
                         if (localFile != null && localFile.exists()) {
-                            playSingleAudioFile(localFile) { _, _ ->
-                                JarvisAccessibilityService.returnToHomeScreen(context)
-                            }
-                        } else {
-                            JarvisAccessibilityService.returnToHomeScreen(context)
+                            playSingleAudioFile(localFile) { _, _ -> }
                         }
                     }
                 } else {
-                    speakCallback("$resolvedName dice: ${savedMsg.text}.") {
-                        JarvisAccessibilityService.returnToHomeScreen(context)
-                    }
+                    speakCallback("$resolvedName dice: ${savedMsg.text}.", null)
                 }
             } else {
-                speakCallback("No encontré mensajes recientes de $resolvedName.") {
-                    JarvisAccessibilityService.returnToHomeScreen(context)
-                }
+                speakCallback("No encontré mensajes recientes de $resolvedName.", null)
             }
         }
 
@@ -483,13 +470,25 @@ object WhatsAppRepository {
                                     expectedGen = currentGen,
                                     expectedDurationMs = lastItem.audioDurationMs
                                 ) {
-                                    JarvisAccessibilityService.returnToHomeScreen(context)
+                                    // Audio finalizado
                                 }
                             }
                         }
                     } else {
-                        speakCallback("$resolvedName dice: ${lastItem.text}.") {
-                            JarvisAccessibilityService.returnToHomeScreen(context)
+                        speakCallback("$resolvedName dice: ${lastItem.text}.", null)
+                    }
+                } else if (screenItems.isNotEmpty()) {
+                    val savedMsg = messages
+                        .filter { isPhoneticMatch(it.senderName, resolvedName) }
+                        .maxByOrNull { it.timestamp }
+                    if (savedMsg != null) {
+                        fallbackToSavedMessage()
+                    } else {
+                        val lastSent = screenItems.last()
+                        if (lastSent.isAudio) {
+                            speakCallback("El último mensaje en el chat fue un audio que enviaste vos.", null)
+                        } else {
+                            speakCallback("El último mensaje en el chat fue tuyo: ${lastSent.text}.", null)
                         }
                     }
                 } else {
@@ -591,9 +590,7 @@ object WhatsAppRepository {
                     playCurrentQueueEntryAndAutoAdvance(context, speakCallback)
                 } else {
                     val label = if (onlyAudio) "audios" else "mensajes"
-                    speakCallback("No encontré $label recientes de $displayPerson.") {
-                        JarvisAccessibilityService.returnToHomeScreen(context)
-                    }
+                    speakCallback("No encontré $label recientes de $displayPerson.", null)
                 }
             }
         }
@@ -648,11 +645,7 @@ object WhatsAppRepository {
             if (chosenOpus != null) {
                 playSingleAudioFile(chosenOpus) { ok, err ->
                     if (!ok && err.isNotBlank()) {
-                        speakCallback(err) {
-                            JarvisAccessibilityService.returnToHomeScreen(context)
-                        }
-                    } else {
-                        JarvisAccessibilityService.returnToHomeScreen(context)
+                        speakCallback(err, null)
                     }
                 }
                 return
@@ -734,9 +727,7 @@ object WhatsAppRepository {
                             activeQueueIndex = 0
                             playCurrentQueueEntryAndAutoAdvance(context, speakCallback)
                         } else {
-                            speakCallback("No encontré mensajes de $dayFilter en el chat de $resolvedDisplayName.") {
-                                JarvisAccessibilityService.returnToHomeScreen(context)
-                            }
+                            speakCallback("No encontré mensajes de $dayFilter en el chat de $resolvedDisplayName.", null)
                         }
                     }
                 }
@@ -810,15 +801,11 @@ object WhatsAppRepository {
         speakCallback: (String, (() -> Unit)?) -> Unit
     ) {
         if (activeQueue.isEmpty()) {
-            speakCallback("No hay mensajes en la lista.") {
-                JarvisAccessibilityService.returnToHomeScreen(context)
-            }
+            speakCallback("No hay mensajes en la lista.", null)
             return
         }
         if (activeQueueIndex !in activeQueue.indices) {
-            speakCallback("Ese fue el último mensaje.") {
-                JarvisAccessibilityService.returnToHomeScreen(context)
-            }
+            speakCallback("Ese fue el último mensaje.", null)
             return
         }
 
@@ -958,11 +945,7 @@ object WhatsAppRepository {
             cb?.invoke(contact, finishedDay)
         } else if (!contact.isNullOrBlank()) {
             val msg = if (finishedDay == "hoy") "Ese fue el último mensaje de hoy." else "Ese fue el último mensaje de $finishedDay."
-            speakCallback?.invoke(msg) {
-                JarvisAccessibilityService.returnToHomeScreen(context)
-            }
-        } else {
-            JarvisAccessibilityService.returnToHomeScreen(context)
+            speakCallback?.invoke(msg, null)
         }
     }
 
@@ -1050,15 +1033,11 @@ object WhatsAppRepository {
                             playCurrentQueueEntryAndAutoAdvance(context, speakCallback)
                         } else {
                             activeQueueContactName = null
-                            speakCallback("Ese fue el último mensaje.") {
-                                JarvisAccessibilityService.returnToHomeScreen(context)
-                            }
+                            speakCallback("Ese fue el último mensaje.", null)
                         }
                     }
                 } else {
-                    speakCallback("Ese fue el último mensaje.") {
-                        JarvisAccessibilityService.returnToHomeScreen(context)
-                    }
+                    speakCallback("Ese fue el último mensaje.", null)
                 }
                 return
             }
@@ -1133,8 +1112,13 @@ object WhatsAppRepository {
         try {
             val cleanPhone = formatPhoneForWhatsApp(rawPhone)
             val uri = Uri.parse("https://api.whatsapp.com/send?phone=$cleanPhone")
+            val targetPkg = if (isPackageInstalled(context.packageManager, "com.whatsapp.w4b") && !isPackageInstalled(context.packageManager, "com.whatsapp")) {
+                "com.whatsapp.w4b"
+            } else {
+                "com.whatsapp"
+            }
             val intent = Intent(Intent.ACTION_VIEW, uri).apply {
-                setPackage("com.whatsapp")
+                setPackage(targetPkg)
                 addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
             }
             context.startActivity(intent)
@@ -1313,7 +1297,6 @@ object WhatsAppRepository {
                 }
                 RemoteInput.addResultsToIntent(recentMsg.remoteInputs, fillInIntent, bundle)
                 recentMsg.replyPendingIntent.send(context, 0, fillInIntent)
-                JarvisAccessibilityService.returnToHomeScreen(context)
                 return "Enviado a ${recentMsg.senderName}."
             } catch (_: Exception) {
             }
@@ -1327,8 +1310,13 @@ object WhatsAppRepository {
             JarvisAccessibilityService.requestAutoClickSendInWhatsApp(contact.first)
 
             val uri = Uri.parse("https://api.whatsapp.com/send?phone=$cleanPhone&text=${Uri.encode(messageText)}")
+            val targetPkg = if (isPackageInstalled(context.packageManager, "com.whatsapp.w4b") && !isPackageInstalled(context.packageManager, "com.whatsapp")) {
+                "com.whatsapp.w4b"
+            } else {
+                "com.whatsapp"
+            }
             val intent = Intent(Intent.ACTION_VIEW, uri).apply {
-                setPackage("com.whatsapp")
+                setPackage(targetPkg)
                 addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
             }
             context.startActivity(intent)
@@ -1723,14 +1711,57 @@ object WhatsAppRepository {
         return dp[b.length]
     }
 
-    private fun formatPhoneForWhatsApp(rawPhone: String): String {
-        val digits = rawPhone.filter { it.isDigit() }
-        return when {
-            digits.startsWith("54") -> digits
-            digits.startsWith("0") -> "549" + digits.drop(1)
-            digits.length == 10 -> "549$digits"
-            else -> digits
+    private fun isPackageInstalled(pm: android.content.pm.PackageManager, packageName: String): Boolean {
+        return try {
+            pm.getPackageInfo(packageName, 0)
+            true
+        } catch (_: Exception) {
+            false
         }
+    }
+
+    private fun formatPhoneForWhatsApp(rawPhone: String): String {
+        var digits = rawPhone.filter { it.isDigit() }
+        if (digits.isEmpty()) return ""
+
+        if (digits.startsWith("0")) {
+            digits = digits.drop(1)
+        }
+
+        if (digits.startsWith("54")) {
+            val afterCountry = digits.drop(2)
+            val withoutNine = if (afterCountry.startsWith("9")) afterCountry.drop(1) else afterCountry
+            val cleanLocal = cleanArgentineFifteenPrefix(withoutNine)
+            return "549$cleanLocal"
+        }
+
+        if (digits.length == 10) {
+            return "549$digits"
+        }
+
+        if (digits.length == 10 && digits.startsWith("15")) {
+            return "54911" + digits.drop(2)
+        }
+
+        val cleanLocal = cleanArgentineFifteenPrefix(digits)
+        if (cleanLocal.length == 10) {
+            return "549$cleanLocal"
+        }
+
+        return digits
+    }
+
+    private fun cleanArgentineFifteenPrefix(number: String): String {
+        if (number.length == 12 && number.substring(2, 4) == "15") {
+            return number.substring(0, 2) + number.substring(4)
+        }
+        if (number.length == 12 && number.substring(3, 5) == "15") {
+            return number.substring(0, 3) + number.substring(5)
+        }
+        if (number.length == 12 && number.substring(4, 6) == "15") {
+            return number.substring(0, 4) + number.substring(6)
+        }
+        return number
     }
 
     fun normalizeText(input: String): String {
