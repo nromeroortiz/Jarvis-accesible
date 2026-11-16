@@ -1086,92 +1086,85 @@ class JarvisAccessibilityService : AccessibilityService() {
     }
 
     /**
-     * Detecta si un mensaje o audio de WhatsApp fue enviado por nosotros (burbuja a la derecha o con tildes ✓✓ de estado)
-     * para poder ignorarlo cuando el usuario pide "el último mensaje/audio de X".
+     * Detecta si un mensaje o audio de WhatsApp fue enviado por nosotros (burbuja a la derecha)
+     * o recibido de la otra persona (burbuja a la izquierda).
+     * En WhatsApp, todo mensaje recibido está en el margen izquierdo (< 20% del ancho de pantalla).
+     * Todo mensaje enviado por nosotros está desplazado a la derecha (>= 20% del ancho de pantalla).
      */
     private fun isOutgoingWhatsAppMessageNode(node: AccessibilityNodeInfo, nodeRect: Rect): Boolean {
         val screenW = screenWidthPx()
         if (screenW <= 0) return false
 
-        // 1. Buscamos el contenedor de la fila completa (hijo directo del RecyclerView)
-        // y el contenedor de la burbuja (el ancestro que no ocupa todo el ancho de la pantalla)
+        // 1. Si el elemento está en el margen izquierdo (< 20% del ancho),
+        // es 100% indiscutiblemente un mensaje o audio entrante de la otra persona (Denise).
+        if (nodeRect.left < (screenW * 0.20f).toInt()) {
+            return false
+        }
+
+        // 2. Si el elemento está en la mitad derecha (>= 48% del ancho),
+        // es 100% indiscutiblemente un mensaje o audio saliente enviado por nosotros.
+        if (nodeRect.left >= (screenW * 0.48f).toInt()) {
+            return true
+        }
+
+        // 3. Para elementos intermedios (entre 20% y 48%), comprobamos la burbuja inmediata (hasta 2 niveles arriba)
+        val maxBubbleHeight = (screenHeightPx() * 0.35f).toInt()
         var current: AccessibilityNodeInfo? = node
-        var rowNode: AccessibilityNodeInfo? = null
-        var bubbleNode: AccessibilityNodeInfo? = null
         var depth = 0
-
-        val maxBubbleWidth = (screenW * 0.92f).toInt()
-        val minBubbleWidth = (screenW * 0.15f).toInt()
-
-        while (current != null && depth < 8) {
+        while (current != null && depth < 2) {
             val p = current.parent ?: break
             val pRect = Rect()
             p.getBoundsInScreen(pRect)
 
-            if (p.isScrollable) {
-                rowNode = current
+            if (pRect.height() > maxBubbleHeight) {
                 break
             }
 
-            if (pRect.width() in minBubbleWidth..maxBubbleWidth && pRect.height() > 15) {
-                bubbleNode = p
+            if (hasOutgoingStatusTickInBubble(p)) {
+                return true
+            }
+
+            val rightMargin = (screenW - pRect.right).coerceAtLeast(0)
+            val leftMargin = pRect.left
+            if (rightMargin < (screenW * 0.15f).toInt() && leftMargin > (screenW * 0.18f).toInt()) {
+                return true
             }
 
             current = p
             depth++
         }
 
-        if (rowNode == null) {
-            rowNode = current
-        }
-
-        // 2. Si la fila completa contiene el ícono o texto de estado (tildes ✓✓ / entregado / leído), es 100% saliente (enviado por nosotros)
-        if (rowNode != null && hasOutgoingStatusTickRecursive(rowNode, maxDepth = 8)) {
-            return true
-        }
-
-        // 3. Si encontramos la burbuja del mensaje, comparamos sus márgenes izquierdo y derecho
-        if (bubbleNode != null) {
-            val bRect = Rect()
-            bubbleNode.getBoundsInScreen(bRect)
-            val leftMargin = bRect.left
-            val rightMargin = (screenW - bRect.right).coerceAtLeast(0)
-
-            // Burbuja alineada a la derecha: margen izquierdo significativamente mayor que el derecho
-            if (leftMargin > rightMargin + (20f * densityScale()).toInt()) {
-                return true
-            }
-            // En WhatsApp las burbujas enviadas tienen un margen izquierdo de al menos 18% del ancho de pantalla
-            if (leftMargin > (screenW * 0.18f).toInt() && rightMargin < (screenW * 0.15f).toInt()) {
-                return true
-            }
-            if (leftMargin < (screenW * 0.12f).toInt()) {
-                return false
-            }
-        }
-
-        // 4. Respaldo por la posición del nodo individual
-        return nodeRect.left > (screenW * 0.35f).toInt()
+        // Si su posición izquierda está desplazada más del 22%, es saliente
+        return nodeRect.left > (screenW * 0.22f).toInt()
     }
 
-    private fun hasOutgoingStatusTickRecursive(node: AccessibilityNodeInfo?, maxDepth: Int): Boolean {
-        if (node == null || maxDepth < 0) return false
-        val viewId = node.viewIdResourceName?.lowercase().orEmpty()
+    private fun hasOutgoingStatusTickInBubble(bubbleNode: AccessibilityNodeInfo?): Boolean {
+        if (bubbleNode == null) return false
+        val viewId = bubbleNode.viewIdResourceName?.lowercase().orEmpty()
         if (viewId.endsWith(":id/status") || viewId.endsWith(":id/status_icon") || viewId.endsWith(":id/msg_status")) {
             return true
         }
 
-        val desc = node.contentDescription?.toString()?.lowercase()?.trim().orEmpty()
+        val desc = bubbleNode.contentDescription?.toString()?.lowercase()?.trim().orEmpty()
         if (desc == "leído" || desc == "leido" || desc == "entregado" || desc == "enviado" ||
             desc == "read" || desc == "delivered" || desc == "sent" || desc == "pendiente" || desc == "pending"
         ) {
             return true
         }
 
-        if (maxDepth == 0) return false
-        for (i in 0 until node.childCount) {
-            val child = node.getChild(i) ?: continue
-            if (hasOutgoingStatusTickRecursive(child, maxDepth - 1)) return true
+        for (i in 0 until bubbleNode.childCount) {
+            val child = bubbleNode.getChild(i) ?: continue
+            val childId = child.viewIdResourceName?.lowercase().orEmpty()
+            if (childId.endsWith(":id/status") || childId.endsWith(":id/status_icon") || childId.endsWith(":id/msg_status")) {
+                return true
+            }
+            val childDesc = child.contentDescription?.toString()?.lowercase()?.trim().orEmpty()
+            if (childDesc == "leído" || childDesc == "leido" || childDesc == "entregado" || childDesc == "enviado" ||
+                childDesc == "read" || childDesc == "delivered" || childDesc == "sent" ||
+                childDesc == "pendiente" || childDesc == "pending"
+            ) {
+                return true
+            }
         }
         return false
     }
@@ -1235,12 +1228,17 @@ class JarvisAccessibilityService : AccessibilityService() {
 
             val isAudioControl = viewId.endsWith(":id/control_btn") ||
                 viewId.endsWith(":id/audio_play_pause_btn") ||
+                viewId.contains("play_pause") ||
+                viewId.contains("control_btn") ||
                 lowerDesc == "reproducir" ||
-                lowerDesc.startsWith("reproducir ") ||
+                lowerDesc.startsWith("reproducir") ||
+                lowerDesc.contains("reproducir mensaje") ||
+                lowerDesc.contains("reproducir audio") ||
                 lowerDesc == "pausar" ||
-                lowerDesc.startsWith("pausar ") ||
+                lowerDesc.startsWith("pausar") ||
                 lowerDesc == "play" ||
                 lowerDesc == "pause" ||
+                lowerDesc.contains("paus") ||
                 lowerText == "reproducir"
 
             if (isAudioControl) {
@@ -1512,10 +1510,14 @@ class JarvisAccessibilityService : AccessibilityService() {
 
             val isAudioBtn = viewId.endsWith(":id/control_btn") ||
                 viewId.endsWith(":id/audio_play_pause_btn") ||
+                viewId.contains("play_pause") ||
+                viewId.contains("control_btn") ||
                 lowerDesc == "reproducir" ||
-                lowerDesc.startsWith("reproducir ") ||
+                lowerDesc.startsWith("reproducir") ||
+                lowerDesc.contains("reproducir mensaje") ||
+                lowerDesc.contains("reproducir audio") ||
                 lowerDesc == "pausar" ||
-                lowerDesc.startsWith("pausar ") ||
+                lowerDesc.startsWith("pausar") ||
                 lowerDesc == "play" ||
                 lowerDesc == "pause" ||
                 lowerDesc.contains("paus") ||
@@ -1887,18 +1889,20 @@ class JarvisAccessibilityService : AccessibilityService() {
         fun requestInspectBottomChatItems(onReady: (List<ScreenChatItem>) -> Unit) {
             onBottomRecentItemsReadyCallback = onReady
             autoInspectBottomRecentUntilTimestamp = System.currentTimeMillis() + 12_000L
-            instance?.mainHandler?.postDelayed({
-                if (autoInspectBottomRecentUntilTimestamp > 0L) {
-                    val root = instance?.rootInActiveWindow ?: return@postDelayed
-                    val items = instance?.extractAllVisibleChatItemsFromCurrentScreen(root).orEmpty()
-                    if (items.isNotEmpty()) {
-                        autoInspectBottomRecentUntilTimestamp = 0L
-                        val cb = onBottomRecentItemsReadyCallback
-                        onBottomRecentItemsReadyCallback = null
-                        cb?.invoke(items)
+            for (delay in listOf(500L, 900L, 1400L)) {
+                instance?.mainHandler?.postDelayed({
+                    if (autoInspectBottomRecentUntilTimestamp > 0L) {
+                        val root = instance?.rootInActiveWindow ?: return@postDelayed
+                        val items = instance?.extractAllVisibleChatItemsFromCurrentScreen(root).orEmpty()
+                        if (items.isNotEmpty() && autoInspectBottomRecentUntilTimestamp > 0L) {
+                            autoInspectBottomRecentUntilTimestamp = 0L
+                            val cb = onBottomRecentItemsReadyCallback
+                            onBottomRecentItemsReadyCallback = null
+                            cb?.invoke(items)
+                        }
                     }
-                }
-            }, 600L)
+                }, delay)
+            }
         }
 
         fun requestAutoPlayInYouTube() {
