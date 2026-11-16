@@ -394,6 +394,7 @@ object WhatsAppRepository {
             } else {
                 // Respaldo con notificaciones guardadas de esa persona
                 val saved = buildSavedEntriesForPersonAndDay(displayPerson, "hoy")
+                    .ifEmpty { buildSavedEntriesForPersonAndDay(displayPerson, "ayer") }
                     .let { list -> if (onlyAudio) list.filter { it.isAudio } else list }
                 val fallbackSelected = when {
                     saved.isEmpty() -> emptyList()
@@ -417,17 +418,24 @@ object WhatsAppRepository {
             val resolvedName = contact?.first ?: targetPerson
             lastOpenedContactName = resolvedName
 
-            if (contact != null) {
-                JarvisAccessibilityService.requestInspectBottomChatItems { items ->
-                    handleExtractedScreenItems(items, resolvedName)
+            val onChatReadyToInspect = {
+                JarvisAccessibilityService.requestInspectOpenChatForDay("hoy") { screenItems ->
+                    val finalItems = if (screenItems.isNotEmpty()) {
+                        screenItems
+                    } else {
+                        JarvisAccessibilityService.instance?.extractAllVisibleChatItemsFromCurrentScreen().orEmpty()
+                    }
+                    handleExtractedScreenItems(finalItems, resolvedName)
                 }
+            }
+
+            if (contact != null) {
+                onChatReadyToInspect()
                 openWhatsAppChatByPhone(context, contact.second)
                 return
             } else {
                 JarvisAccessibilityService.requestSearchAndOpenChatInWhatsApp(targetPerson) {
-                    JarvisAccessibilityService.requestInspectBottomChatItems { items ->
-                        handleExtractedScreenItems(items, resolvedName)
-                    }
+                    onChatReadyToInspect()
                 }
                 launchWhatsAppHome(context)
                 return
