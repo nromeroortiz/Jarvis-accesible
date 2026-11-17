@@ -228,45 +228,47 @@ object WhatsAppRepository {
 
         if (cleanSender.isEmpty() || cleanText.isEmpty()) return
         if (cleanSender.equals("WhatsApp", ignoreCase = true)) return
-        if (cleanText.contains("mensajes nuevos", ignoreCase = true)) return
         if (cleanText.contains("buscando mensajes", ignoreCase = true)) return
         if (cleanText.contains("copia de seguridad", ignoreCase = true)) return
 
+        val isGeneric = cleanText.contains("mensajes nuevos", ignoreCase = true) ||
+            cleanText.contains("nuevos mensajes", ignoreCase = true) ||
+            cleanText.contains("mensaje nuevo", ignoreCase = true) ||
+            cleanText.contains("nuevo mensaje", ignoreCase = true)
+        val effectiveText = if (isGeneric) "Mensaje nuevo" else cleanText
+
         lastOpenedContactName = cleanSender
 
-        ioExecutor.execute {
-            ensureHistoryLoaded(context.applicationContext)
-            // Deduplicación precisa: si ya existe este mismo mensaje de este remitente con timestamp idéntico o muy cercano, no lo duplicamos
-            val alreadyExists = messages.any {
-                it.senderName.equals(cleanSender, ignoreCase = true) &&
-                    it.text == cleanText &&
-                    (abs(it.timestamp - timestamp) < 4_000L || (timestamp == 0L && abs(System.currentTimeMillis() - it.timestamp) < 30_000L))
-            }
-            if (alreadyExists) return@execute
+        ensureHistoryLoaded(context.applicationContext)
+        val effectiveTimestamp = if (timestamp > 0L) timestamp else System.currentTimeMillis()
 
-            val latestAudioPath = if (isVoiceNote) {
-                findLatestWhatsAppVoiceNoteFile(maxAgeMillis = 180_000L)?.absolutePath
-            } else {
-                null
-            }
-
-            val effectiveTimestamp = if (timestamp > 0L) timestamp else System.currentTimeMillis()
-
-            messages.add(
-                WhatsAppIncomingMessage(
-                    id = id,
-                    senderName = cleanSender,
-                    text = cleanText,
-                    isVoiceNote = isVoiceNote,
-                    timestamp = effectiveTimestamp,
-                    replyPendingIntent = replyIntent,
-                    remoteInputs = remoteInputs,
-                    associatedAudioPath = latestAudioPath,
-                    isReadByUncle = false
-                )
-            )
-            saveHistoryToDisk(context)
+        val alreadyExists = messages.any {
+            it.senderName.equals(cleanSender, ignoreCase = true) &&
+                it.text == effectiveText &&
+                (abs(it.timestamp - effectiveTimestamp) < 4_000L || (effectiveTimestamp == 0L && abs(System.currentTimeMillis() - it.timestamp) < 30_000L))
         }
+        if (alreadyExists) return
+
+        val latestAudioPath = if (isVoiceNote) {
+            findLatestWhatsAppVoiceNoteFile(maxAgeMillis = 180_000L)?.absolutePath
+        } else {
+            null
+        }
+
+        messages.add(
+            WhatsAppIncomingMessage(
+                id = id,
+                senderName = cleanSender,
+                text = effectiveText,
+                isVoiceNote = isVoiceNote,
+                timestamp = effectiveTimestamp,
+                replyPendingIntent = replyIntent,
+                remoteInputs = remoteInputs,
+                associatedAudioPath = latestAudioPath,
+                isReadByUncle = false
+            )
+        )
+        saveHistoryToDisk(context)
     }
 
     data class UnreadQueueItem(
@@ -294,9 +296,23 @@ object WhatsAppRepository {
         stopAudioPlayback()
         val currentGen = ++autoAdvanceGeneration
 
+        WhatsAppNotificationService.instance?.syncActiveNotifications()
+
         // Mensajes no leídos ordenados cronológicamente del más viejo al más nuevo
         val unread = messages.filter { !it.isReadByUncle }.sortedBy { it.timestamp }
         if (unread.isEmpty()) {
+            val unreadOnScreen = JarvisAccessibilityService.instance?.detectUnreadChatsOnScreen().orEmpty()
+            if (unreadOnScreen.isNotEmpty()) {
+                val senders = unreadOnScreen.map { it.first }.distinct()
+                val intro = if (senders.size == 1) {
+                    "Tenés un chat sin abrir de ${senders.first()} con mensajes nuevos."
+                } else {
+                    "Tenés chats sin abrir de ${senders.joinToString(" y ")} con mensajes nuevos."
+                }
+                speakCallback(intro, null)
+                return
+            }
+
             speakCallback("No tenés mensajes nuevos.", null)
             return
         }
@@ -463,7 +479,19 @@ object WhatsAppRepository {
                                 onlyIncoming = true
                             ) ?: false
                             if (!clicked) {
-                                fallbackToSavedMessage()
+                                val clickedAny = JarvisAccessibilityService.instance?.clickLatestAudioInCurrentChatScreen(
+                                    fromBottomIndex = 0,
+                                    onlyIncoming = false
+                                ) ?: false
+                                if (!clickedAny) {
+                                    fallbackToSavedMessage()
+                                } else {
+                                    scheduleScreenAudioCompletionMonitor(
+                                        context = context,
+                                        expectedGen = currentGen,
+                                        expectedDurationMs = lastItem.audioDurationMs
+                                    ) {}
+                                }
                             } else {
                                 scheduleScreenAudioCompletionMonitor(
                                     context = context,
@@ -495,6 +523,12 @@ object WhatsAppRepository {
                     fallbackToSavedMessage()
                 }
             }
+        }
+
+        val service = JarvisAccessibilityService.instance
+        if (service != null && service.isChatOpenForContact(resolvedName)) {
+            onChatReadyToInspect()
+            return
         }
 
         if (contact != null) {
@@ -733,6 +767,12 @@ object WhatsAppRepository {
                 }
             }
 
+            val service = JarvisAccessibilityService.instance
+            if (service != null && service.isChatOpenForContact(resolvedDisplayName)) {
+                onChatReadyToInspect()
+                return
+            }
+
             if (contact != null) {
                 onChatReadyToInspect()
                 openWhatsAppChatByPhone(context, contact.second)
@@ -779,6 +819,7 @@ object WhatsAppRepository {
                     dayFilter = dayFilter
                 )
             } else {
+                alreadyReadTextsInCurrentDay.add("AUDIO_ITEM_${item.audioOrderInDay}_${item.topY}")
                 val spoken = if (item.isOutgoing) {
                     "Vos mandaste un audio."
                 } else {
@@ -937,8 +978,10 @@ object WhatsAppRepository {
     private fun notifyEndOfDayReached(context: Context? = null, speakCallback: ((String, (() -> Unit)?) -> Unit)? = null) {
         val finishedDay = activeQueueDayFilter
         val contact = activeQueueContactName
+        activeQueue = emptyList()
         activeQueueContactName = null
         lastLoadedScreenItems = emptyList()
+        alreadyReadTextsInCurrentDay.clear()
         if (finishedDay != "hoy" && !contact.isNullOrBlank() && onPastDayFinishedCallback != null) {
             val cb = onPastDayFinishedCallback
             onPastDayFinishedCallback = null
@@ -983,13 +1026,23 @@ object WhatsAppRepository {
                     consecutiveQuietChecks++
                 }
 
-                val maxWaitForThisAudio = (expectedDurationMs + 1_800L).coerceAtLeast(3_800L)
-                if ((hasSeenAudioPlaying && consecutiveQuietChecks >= 2) ||
-                    (!hasSeenAudioPlaying && elapsed >= 2_800L && consecutiveQuietChecks >= 2) ||
-                    elapsed >= maxWaitForThisAudio
-                ) {
+                val minNaturalDuration = if (expectedDurationMs > 3000L) (expectedDurationMs * 0.70f).toLong() else 2500L
+                val maxWaitForThisAudio = (expectedDurationMs + 2_500L).coerceAtLeast(4_500L)
+
+                if (hasSeenAudioPlaying && consecutiveQuietChecks >= 2) {
+                    // Si el audio se detuvo mucho antes de su duración estimada, significa que el usuario lo pausó voluntariamente
+                    if (elapsed < minNaturalDuration) {
+                        // El usuario pausó el audio: cortamos el monitor para no entrar en bucle y no auto-avanzar
+                        autoAdvanceGeneration++
+                        return
+                    }
                     onCompleted()
-                } else if (elapsed < 240_000L) {
+                } else if (!hasSeenAudioPlaying && elapsed >= 3_500L && consecutiveQuietChecks >= 2) {
+                    // Si no arrancó tras varios intentos, avanzamos una sola vez sin entrar en bucle infinito
+                    onCompleted()
+                } else if (elapsed >= maxWaitForThisAudio) {
+                    onCompleted()
+                } else if (elapsed < 300_000L) {
                     mainHandler.postDelayed(this, 350L)
                 }
             }
@@ -1210,6 +1263,10 @@ object WhatsAppRepository {
 
     fun stopAudioPlayback() {
         autoAdvanceGeneration++
+        activeQueue = emptyList()
+        activeQueueContactName = null
+        lastLoadedScreenItems = emptyList()
+        alreadyReadTextsInCurrentDay.clear()
         try {
             mediaPlayer?.stop()
         } catch (_: Exception) {
@@ -1220,6 +1277,7 @@ object WhatsAppRepository {
         }
         mediaPlayer = null
         stopRecordingInternal()
+        JarvisAccessibilityService.instance?.pauseAnyPlayingVoiceNoteOnScreen()
     }
 
     private fun findLatestWhatsAppVoiceNoteFile(maxAgeMillis: Long): File? {

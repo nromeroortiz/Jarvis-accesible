@@ -228,6 +228,7 @@ object SystemActionsController {
 
     fun stopAnythingPlayingOrRinging(context: Context): String {
         WhatsAppRepository.stopAudioPlayback()
+        com.jarvis.accesible.services.JarvisAccessibilityService.instance?.pauseAnyPlayingVoiceNoteOnScreen()
 
         try {
             val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager

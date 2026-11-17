@@ -646,6 +646,11 @@ class JarvisAccessibilityService : AccessibilityService() {
         val searchInput = editNodes.firstOrNull()
 
         if (searchInput == null) {
+            // Prioridad absoluta: hacer clic en el nombre o fila del chat, nunca en la foto de perfil
+            if (clickContactRowOrNameMatching(root, query)) {
+                completeSearchChatOpened()
+                return
+            }
             if (clickNodeMatchingPhonetically(root, query, minTop = 220)) {
                 completeSearchChatOpened()
                 return
@@ -719,14 +724,105 @@ class JarvisAccessibilityService : AccessibilityService() {
         }
     }
 
+    private fun isAvatarOrProfilePhotoNode(node: AccessibilityNodeInfo?): Boolean {
+        if (node == null) return false
+        val id = node.viewIdResourceName?.lowercase().orEmpty()
+        val desc = node.contentDescription?.toString()?.lowercase().orEmpty()
+        val isPhotoId = id.contains("contact_photo") ||
+            id.contains("avatar") ||
+            id.contains("picture") ||
+            id.contains("profile_photo") ||
+            id.contains("contact_avatar") ||
+            id.contains("photo")
+        val isPhotoDesc = desc.contains("foto del perfil") ||
+            desc.contains("foto de perfil") ||
+            desc.contains("profile photo") ||
+            desc.contains("ver foto") ||
+            desc.contains("imagen de perfil") ||
+            desc.contains("foto") ||
+            desc.contains("perfil")
+        return isPhotoId || isPhotoDesc
+    }
+
+    private fun clickContactRowOrNameMatching(root: AccessibilityNodeInfo, query: String): Boolean {
+        val minTop = chatContentMinTopPx()
+        val nameIds = listOf(
+            "com.whatsapp:id/conversations_row_contact_name",
+            "com.whatsapp.w4b:id/conversations_row_contact_name"
+        )
+        for (id in nameIds) {
+            val nodes = root.findAccessibilityNodeInfosByViewId(id)
+            if (!nodes.isNullOrEmpty()) {
+                for (n in nodes) {
+                    val rect = Rect()
+                    n.getBoundsInScreen(rect)
+                    if (rect.top >= minTop) {
+                        val txt = n.text?.toString().orEmpty()
+                        if (txt.isNotBlank() && isPhoneticContactMatch(txt, query)) {
+                            val rowContainer = findParentRowContainer(n) ?: n
+                            if (clickNodeOrParent(rowContainer)) return true
+                        }
+                    }
+                }
+            }
+        }
+        return false
+    }
+
+    fun isChatOpenForContact(contactQuery: String): Boolean {
+        val root = rootInActiveWindow ?: return false
+        val pkg = root.packageName?.toString().orEmpty()
+        if (!pkg.startsWith("com.whatsapp")) return false
+
+        val nameIds = listOf(
+            "com.whatsapp:id/conversation_contact_name",
+            "com.whatsapp.w4b:id/conversation_contact_name"
+        )
+        for (id in nameIds) {
+            val nodes = root.findAccessibilityNodeInfosByViewId(id)
+            if (!nodes.isNullOrEmpty()) {
+                for (n in nodes) {
+                    val txt = n.text?.toString()?.trim().orEmpty()
+                    if (txt.isNotBlank() && isPhoneticContactMatch(txt, contactQuery)) {
+                        return true
+                    }
+                }
+            }
+        }
+        return false
+    }
+
+    private fun findFirstNonEmptyText(node: AccessibilityNodeInfo?): String {
+        if (node == null) return ""
+        val t = node.text?.toString()?.trim().orEmpty()
+        if (t.isNotEmpty()) return t
+        for (i in 0 until node.childCount) {
+            val child = node.getChild(i) ?: continue
+            val ct = findFirstNonEmptyText(child)
+            if (ct.isNotEmpty()) return ct
+        }
+        return ""
+    }
+
     private fun clickFirstSearchResultInWhatsApp(root: AccessibilityNodeInfo, query: String): Boolean {
         val minTop = chatContentMinTopPx()
+
+        // 1. Prioridad: Buscar el TextView con el nombre del contacto en la fila y tocar la fila
+        if (clickContactRowOrNameMatching(root, query)) {
+            return true
+        }
+
+        // 2. Coincidencia fonética en el árbol ignorando fotos de perfil
         if (clickNodeMatchingPhonetically(root, query, minTop = minTop)) {
             return true
         }
+
+        // 3. Fila contenedora verificando coincidencia con el contacto
         val rowIds = listOf(
             "com.whatsapp:id/contact_row_container",
-            "com.whatsapp:id/conversations_row_contact_name"
+            "com.whatsapp.w4b:id/contact_row_container",
+            "com.whatsapp:id/conversations_row_contact_name",
+            "com.whatsapp.w4b:id/conversations_row_contact_name"
         )
         for (id in rowIds) {
             val nodes = root.findAccessibilityNodeInfosByViewId(id)
@@ -734,8 +830,11 @@ class JarvisAccessibilityService : AccessibilityService() {
                 for (n in nodes) {
                     val rect = Rect()
                     n.getBoundsInScreen(rect)
-                    if (rect.top > minTop && clickNodeOrParent(n)) {
-                        return true
+                    if (rect.top > minTop && !isAvatarOrProfilePhotoNode(n)) {
+                        val rowName = extractContactNameFromRow(n) ?: n.text?.toString().orEmpty()
+                        if (rowName.isNotBlank() && isPhoneticContactMatch(rowName, query)) {
+                            if (clickNodeOrParent(n)) return true
+                        }
                     }
                 }
             }
@@ -750,12 +849,11 @@ class JarvisAccessibilityService : AccessibilityService() {
         val targetDay = normalize(requestedDayFilter ?: "hoy")
         val extracted = extractChatItemsByDayFromTree(root, targetDay)
 
-        // Si el usuario pidió un día anterior ("ayer", "viernes", etc.) y aún no encontramos su cartel de inicio,
-        // subimos haciendo scroll hacia atrás. Si pidió "hoy", WhatsApp ya abre al fondo en los mensajes de hoy.
-        val alreadyAboveToday = targetDay == "hoy" && extracted.sawOlderHeaderOnScreen
+        // Subir con scroll si aún no vemos el cartel de inicio de este día
+        // ("HOY", "AYER", fecha) ni ningún cartel anterior que demuestre que ya estamos arriba del día.
+        val alreadyAboveTargetDay = extracted.sawOlderHeaderOnScreen
         val needsScrollUpToFindStartOfDay = !extracted.sawExactDayHeaderBanner &&
-            !alreadyAboveToday &&
-            targetDay != "hoy" &&
+            !alreadyAboveTargetDay &&
             scrollAttemptsLeft > 0
 
         if (needsScrollUpToFindStartOfDay) {
@@ -786,8 +884,14 @@ class JarvisAccessibilityService : AccessibilityService() {
             }
         }
 
+        // Si ya tenemos items de este día, entregarlos de inmediato
+        if (extracted.items.isNotEmpty()) {
+            deliverExtractedDayItems(extracted.items)
+            return
+        }
+
         // Si todavía no hay items y WhatsApp aún está abriendo la conversación, permitimos más reintentos
-        if (extracted.items.isEmpty() && autoInspectDayChatUntilTimestamp > System.currentTimeMillis() + 1500L) {
+        if (autoInspectDayChatUntilTimestamp > System.currentTimeMillis() + 1500L) {
             return
         }
 
@@ -835,11 +939,11 @@ class JarvisAccessibilityService : AccessibilityService() {
                 return@postDelayed
             }
 
-            // 1. Si el último elemento de abajo está en la misma posición vertical y es igual al anterior,
+            // 1. Si el último elemento de abajo está prácticamente en la misma posición vertical y es idéntico al anterior,
             // significa que el chat ya llegó al fondo y no se movió nada -> cortamos para no entrar en bucle.
             if (prevBottom != null) {
                 val afterBottom = afterItems.last()
-                val sameBottomPos = abs(afterBottom.topY - prevBottom.topY) < (26f * densityScale()).toInt()
+                val sameBottomPos = abs(afterBottom.topY - prevBottom.topY) < (35f * densityScale()).toInt()
                 if (sameBottomPos && afterBottom.isAudio == prevBottom.isAudio && afterBottom.text == prevBottom.text) {
                     onMoreItemsLoaded(emptyList())
                     return@postDelayed
@@ -853,7 +957,7 @@ class JarvisAccessibilityService : AccessibilityService() {
                     for (idx in 0 until k) {
                         val prevElem = previousScreenItems[previousScreenItems.size - k + idx]
                         val nextElem = afterItems[idx]
-                        if (prevElem.isAudio != nextElem.isAudio || prevElem.text != nextElem.text) {
+                        if (prevElem.isAudio != nextElem.isAudio || (!prevElem.isAudio && prevElem.text != nextElem.text)) {
                             allMatch = false
                             break
                         }
@@ -871,17 +975,15 @@ class JarvisAccessibilityService : AccessibilityService() {
                 }
             }
 
-            // 3. Si fue un salto completo de pantalla sin superposición, solo avanzamos si aparecieron textos nuevos no leídos
-            val unreadTextsOnly = afterItems.filter { !it.isAudio && !alreadyReadTexts.contains(it.text) }
-            if (unreadTextsOnly.isEmpty()) {
-                onMoreItemsLoaded(emptyList())
-            } else {
-                val firstNewTopY = unreadTextsOnly.first().topY
-                val itemsFromFirstNew = afterItems.filter {
-                    it.topY >= firstNewTopY && (it.isAudio || !alreadyReadTexts.contains(it.text))
+            // 3. Si fue un salto completo de pantalla sin superposición, solo devolvemos elementos que no hayan sido leídos
+            val strictlyNewInScreen = afterItems.filter { item ->
+                if (!item.isAudio) {
+                    !alreadyReadTexts.contains(item.text)
+                } else {
+                    !alreadyReadTexts.contains("AUDIO_ITEM_${item.audioOrderInDay}_${item.topY}")
                 }
-                onMoreItemsLoaded(itemsFromFirstNew)
             }
+            onMoreItemsLoaded(strictlyNewInScreen)
         }, 480L)
     }
 
@@ -1105,34 +1207,23 @@ class JarvisAccessibilityService : AccessibilityService() {
         return listOf(f1, f2, f3, f4, f5).filter { it.isNotEmpty() }
     }
 
-    /**
-     * Detecta si un mensaje o audio de WhatsApp fue enviado por nosotros (burbuja a la derecha)
-     * o recibido de la otra persona (burbuja a la izquierda).
-     * En WhatsApp, los mensajes recibidos están estrictamente anclados al margen izquierdo.
-     * Los mensajes enviados por nosotros contienen tildes de entrega/lectura y están anclados al margen derecho.
-     */
-    private fun isOutgoingWhatsAppMessageNode(node: AccessibilityNodeInfo, nodeRect: Rect): Boolean {
-        val screenW = screenWidthPx()
-        if (screenW <= 0) return false
-
-        // 1. Verificación geométrica directa del elemento (texto o botón de reproducir/pausar audio):
-        // En WhatsApp (LTR), cualquier elemento entrante de la otra persona está anclado a la izquierda (< 26% del ancho de pantalla).
-        if (nodeRect.left < (screenW * 0.26f).toInt()) {
-            return false
+    private fun getActualScreenWidth(): Int {
+        val root = rootInActiveWindow
+        if (root != null) {
+            val r = Rect()
+            root.getBoundsInScreen(r)
+            if (r.width() > 320) return r.width()
         }
+        return screenWidthPx()
+    }
 
-        // Cualquier elemento saliente (enviado por nosotros) está desplazado hacia la derecha (>= 40% del ancho).
-        if (nodeRect.left >= (screenW * 0.40f).toInt()) {
-            return true
-        }
-
-        // 2. Para elementos intermedios (burbujas muy anchas o centradas),
-        // inspeccionamos la burbuja contenedora inmediata (máximo 2 niveles arriba).
-        // NUNCA subir hasta el RecyclerView o ListView para no evaluar los demás mensajes del chat.
-        val maxBubbleHeight = (screenHeightPx() * 0.35f).toInt()
+    private fun findMessageBubbleContainer(node: AccessibilityNodeInfo): AccessibilityNodeInfo? {
+        val maxBubbleHeight = (screenHeightPx() * 0.45f).toInt()
+        val screenW = getActualScreenWidth()
         var current: AccessibilityNodeInfo? = node
+        var candidate: AccessibilityNodeInfo? = null
         var depth = 0
-        while (current != null && depth < 2) {
+        while (current != null && depth < 5) {
             val p = current.parent ?: break
             val pClass = p.className?.toString().orEmpty()
             if (p.isScrollable || pClass.contains("RecyclerView") || pClass.contains("ListView") || pClass.contains("AbsListView")) {
@@ -1140,59 +1231,139 @@ class JarvisAccessibilityService : AccessibilityService() {
             }
             val pRect = Rect()
             p.getBoundsInScreen(pRect)
-            if (pRect.height() > maxBubbleHeight) {
-                break
+            // Una burbuja real de mensaje de WhatsApp nunca ocupa el 100% del ancho de pantalla (máximo ~88%)
+            if (pRect.height() in 20..maxBubbleHeight && pRect.width() in 40..(screenW * 0.88f).toInt()) {
+                candidate = p
+                val pId = p.viewIdResourceName?.lowercase().orEmpty()
+                if (pId.contains("bubble") || pId.contains("main_layout") || pId.contains("content")) {
+                    return p
+                }
             }
-
-            if (hasOutgoingStatusTickInBubble(p)) {
-                return true
-            }
-
-            val leftMargin = pRect.left
-            val rightMargin = screenW - pRect.right
-            if (leftMargin < (screenW * 0.18f).toInt() && rightMargin >= (screenW * 0.08f).toInt()) {
-                return false
-            }
-            if (rightMargin < (screenW * 0.15f).toInt() && leftMargin >= (screenW * 0.18f).toInt()) {
-                return true
-            }
-
             current = p
             depth++
         }
-
-        return false
+        return candidate
     }
 
     private fun hasOutgoingStatusTickInBubble(bubbleNode: AccessibilityNodeInfo?): Boolean {
-        if (bubbleNode == null || bubbleNode.childCount > 10) return false
-        val viewId = bubbleNode.viewIdResourceName?.lowercase().orEmpty()
-        if (viewId.endsWith(":id/status") || viewId.endsWith(":id/status_icon") || viewId.endsWith(":id/msg_status")) {
+        if (bubbleNode == null) return false
+        return checkStatusTickRecursive(bubbleNode, depth = 0)
+    }
+
+    private fun checkStatusTickRecursive(node: AccessibilityNodeInfo?, depth: Int): Boolean {
+        if (node == null || depth > 4) return false
+
+        val desc = node.contentDescription?.toString()?.lowercase()?.trim().orEmpty()
+        val isExplicitStatusDesc = desc in listOf("leído", "leido", "entregado", "enviado", "read", "delivered", "sent", "pendiente", "pending") ||
+            desc.startsWith("leído a las") || desc.startsWith("leido a las") ||
+            desc.startsWith("entregado a las") || desc.startsWith("enviado a las") ||
+            desc.startsWith("read at") || desc.startsWith("delivered at") || desc.startsWith("sent at")
+
+        if (isExplicitStatusDesc) {
             return true
         }
 
-        val desc = bubbleNode.contentDescription?.toString()?.lowercase()?.trim().orEmpty()
-        if (desc == "leído" || desc == "leido" || desc == "entregado" || desc == "enviado" ||
-            desc == "read" || desc == "delivered" || desc == "sent" || desc == "pendiente" || desc == "pending"
-        ) {
-            return true
-        }
-
-        for (i in 0 until bubbleNode.childCount) {
-            val child = bubbleNode.getChild(i) ?: continue
-            val childId = child.viewIdResourceName?.lowercase().orEmpty()
-            if (childId.endsWith(":id/status") || childId.endsWith(":id/status_icon") || childId.endsWith(":id/msg_status")) {
-                return true
-            }
-            val childDesc = child.contentDescription?.toString()?.lowercase()?.trim().orEmpty()
-            if (childDesc == "leído" || childDesc == "leido" || childDesc == "entregado" || childDesc == "enviado" ||
-                childDesc == "read" || childDesc == "delivered" || childDesc == "sent" ||
-                childDesc == "pendiente" || childDesc == "pending"
-            ) {
-                return true
-            }
+        for (i in 0 until node.childCount) {
+            val child = node.getChild(i) ?: continue
+            if (checkStatusTickRecursive(child, depth + 1)) return true
         }
         return false
+    }
+
+    private fun hasIncomingAvatarOrSenderName(rowNode: AccessibilityNodeInfo?): Boolean {
+        if (rowNode == null) return false
+        val screenW = getActualScreenWidth()
+        return checkIncomingIndicatorsRecursive(rowNode, screenW, depth = 0)
+    }
+
+    private fun checkIncomingIndicatorsRecursive(node: AccessibilityNodeInfo?, screenW: Int, depth: Int): Boolean {
+        if (node == null || depth > 3) return false
+        val id = node.viewIdResourceName?.lowercase().orEmpty()
+        val desc = node.contentDescription?.toString()?.lowercase().orEmpty()
+        val isAvatar = id.contains("contact_photo") || id.contains("avatar") || id.contains("picture") ||
+            desc.contains("foto del perfil") || desc.contains("foto de perfil")
+        val isSenderName = id.endsWith(":id/name") || id.endsWith(":id/sender_name")
+        if (isAvatar || isSenderName) {
+            val r = Rect()
+            node.getBoundsInScreen(r)
+            if (r.left < screenW * 0.25f && r.width() > 10) {
+                return true
+            }
+        }
+        for (i in 0 until node.childCount) {
+            val child = node.getChild(i) ?: continue
+            if (checkIncomingIndicatorsRecursive(child, screenW, depth + 1)) return true
+        }
+        return false
+    }
+
+    /**
+     * Detecta si un mensaje o audio de WhatsApp fue enviado por nosotros (burbuja a la derecha)
+     * o recibido de la otra persona (burbuja a la izquierda).
+     */
+    private fun isOutgoingWhatsAppMessageNode(node: AccessibilityNodeInfo, nodeRect: Rect): Boolean {
+        val screenW = getActualScreenWidth()
+        if (screenW <= 0) return false
+
+        val bubble = findMessageBubbleContainer(node)
+        val bubbleRect = Rect()
+        val hasValidBubble = if (bubble != null) {
+            bubble.getBoundsInScreen(bubbleRect)
+            bubbleRect.width() in 40..(screenW * 0.88f).toInt()
+        } else false
+
+        // 1. Si tiene tilde explícita de entrega/lectura ("enviado", "leído", "entregado") -> DEFINITIVAMENTE SALIENTE (nuestro)
+        if (hasOutgoingStatusTickInBubble(bubble ?: node)) {
+            return true
+        }
+
+        // 2. Si tiene avatar de contacto o nombre de remitente a la izquierda -> DEFINITIVAMENTE ENTRANTE (otra persona)
+        val rowParent = bubble?.parent ?: node.parent
+        if (hasIncomingAvatarOrSenderName(rowParent)) {
+            return false
+        }
+
+        // 3. Verificación de márgenes si se detectó la burbuja:
+        if (hasValidBubble) {
+            val bubbleLeft = bubbleRect.left
+            val bubbleRightMargin = screenW - bubbleRect.right
+
+            // Burbuja anclada a la izquierda (entrante):
+            // Margen izquierdo chico (< 20%) y margen derecho amplio (>= 10%)
+            if (bubbleLeft < (screenW * 0.20f).toInt() && bubbleRightMargin >= (screenW * 0.10f).toInt()) {
+                return false
+            }
+
+            // Burbuja anclada a la derecha (saliente):
+            // Margen derecho chico (< 20%) y margen izquierdo amplio (>= 10%)
+            if (bubbleRightMargin < (screenW * 0.20f).toInt() && bubbleLeft >= (screenW * 0.10f).toInt()) {
+                return true
+            }
+
+            return bubbleRightMargin < bubbleLeft
+        }
+
+        // 4. Si no se detectó contenedor de burbuja (o es el nodo directo):
+        val viewId = node.viewIdResourceName?.lowercase().orEmpty()
+        val isAudio = viewId.contains("control_btn") || viewId.contains("play") || viewId.contains("audio")
+
+        if (isAudio) {
+            // El botón play de un audio entrante está a la izquierda (< 25% screenW).
+            // En un audio saliente (nuestro), la burbuja está a la derecha, por lo que el botón play está en x >= 25% screenW.
+            return nodeRect.left >= (screenW * 0.25f).toInt()
+        }
+
+        val nodeLeft = nodeRect.left
+        val nodeRightMargin = screenW - nodeRect.right
+
+        if (nodeLeft < (screenW * 0.18f).toInt() && nodeRightMargin >= (screenW * 0.08f).toInt()) {
+            return false
+        }
+        if (nodeRightMargin < (screenW * 0.18f).toInt() && nodeLeft >= (screenW * 0.08f).toInt()) {
+            return true
+        }
+
+        return nodeRightMargin < nodeLeft
     }
 
     private fun collectChatScreenElements(
@@ -1230,10 +1401,16 @@ class JarvisAccessibilityService : AccessibilityService() {
                     DATE_TEXT_SLASH_REGEX.matches(lowerText)
                 )
 
-            if (isDateDividerId || isDateBannerText) {
-                if (text.isNotEmpty()) {
-                    outList.add(RawScreenElement("HEADER", text, rect.top))
+            if (isDateDividerId) {
+                val bannerText = if (text.isNotEmpty()) text else findFirstNonEmptyText(node)
+                if (bannerText.isNotEmpty()) {
+                    outList.add(RawScreenElement("HEADER", bannerText, rect.top))
                 }
+                return
+            }
+
+            if (isDateBannerText) {
+                outList.add(RawScreenElement("HEADER", text, rect.top))
                 return
             }
 
@@ -1423,6 +1600,7 @@ class JarvisAccessibilityService : AccessibilityService() {
     }
 
     fun pauseAnyPlayingVoiceNoteOnScreen() {
+        WhatsAppRepository.autoAdvanceGeneration++
         val root = rootInActiveWindow ?: return
         val audioBtnIds = listOf(
             "com.whatsapp:id/control_btn",
@@ -1447,6 +1625,81 @@ class JarvisAccessibilityService : AccessibilityService() {
         if (!checkedById) {
             pausePlayingNodeRecursive(root)
         }
+    }
+
+    /**
+     * Inspecciona la lista de chats abiertos de WhatsApp en busca de filas que tengan
+     * el globo verde de mensajes no leídos (conversations_row_message_count) o descripciones de no leído.
+     */
+    fun detectUnreadChatsOnScreen(): List<Pair<String, Int>> {
+        val root = rootInActiveWindow ?: return emptyList()
+        val pkg = root.packageName?.toString().orEmpty()
+        if (!pkg.startsWith("com.whatsapp")) return emptyList()
+
+        val results = mutableListOf<Pair<String, Int>>()
+        val countNodes = root.findAccessibilityNodeInfosByViewId("com.whatsapp:id/conversations_row_message_count")
+            .ifEmpty { root.findAccessibilityNodeInfosByViewId("com.whatsapp.w4b:id/conversations_row_message_count") }
+        if (!countNodes.isNullOrEmpty()) {
+            for (countNode in countNodes) {
+                val countText = countNode.text?.toString()?.trim().orEmpty()
+                val count = countText.toIntOrNull() ?: 1
+                val rowContainer = findParentRowContainer(countNode)
+                val contactName = rowContainer?.let { extractContactNameFromRow(it) }
+                if (!contactName.isNullOrBlank()) {
+                    results.add(Pair(contactName, count))
+                }
+            }
+        }
+        if (results.isEmpty()) {
+            collectUnreadFromDescriptions(root, results)
+        }
+        return results
+    }
+
+    private fun collectUnreadFromDescriptions(node: AccessibilityNodeInfo?, outList: MutableList<Pair<String, Int>>) {
+        if (node == null) return
+        val desc = node.contentDescription?.toString()?.lowercase().orEmpty()
+        if (desc.contains("no leido") || desc.contains("no leído") || desc.contains("unread")) {
+            val contact = extractContactNameFromRow(node)
+                ?: findParentRowContainer(node)?.let { extractContactNameFromRow(it) }
+            if (!contact.isNullOrBlank() && outList.none { it.first.equals(contact, ignoreCase = true) }) {
+                outList.add(Pair(contact, 1))
+            }
+        }
+        for (i in 0 until node.childCount) {
+            val child = node.getChild(i) ?: continue
+            collectUnreadFromDescriptions(child, outList)
+        }
+    }
+
+    private fun findParentRowContainer(node: AccessibilityNodeInfo): AccessibilityNodeInfo? {
+        var current: AccessibilityNodeInfo? = node
+        var depth = 0
+        while (current != null && depth < 4) {
+            val p = current.parent ?: break
+            val id = p.viewIdResourceName?.lowercase().orEmpty()
+            if (id.contains("contact_row_container") || id.contains("conversations_row")) {
+                return p
+            }
+            current = p
+            depth++
+        }
+        return node.parent
+    }
+
+    private fun extractContactNameFromRow(rowNode: AccessibilityNodeInfo): String? {
+        val nameNodes = rowNode.findAccessibilityNodeInfosByViewId("com.whatsapp:id/conversations_row_contact_name")
+        val txt = nameNodes?.firstOrNull()?.text?.toString()?.trim()
+        if (!txt.isNullOrBlank()) return txt
+        for (i in 0 until rowNode.childCount) {
+            val child = rowNode.getChild(i) ?: continue
+            val childId = child.viewIdResourceName?.lowercase().orEmpty()
+            if (childId.contains("contact_name") || childId.contains("title")) {
+                val t = child.text?.toString()?.trim()
+                if (!t.isNullOrBlank()) return t
+            }
+        }
+        return null
     }
 
     private fun pausePlayingNodeRecursive(node: AccessibilityNodeInfo?): Boolean {
@@ -1607,6 +1860,8 @@ class JarvisAccessibilityService : AccessibilityService() {
         minTop: Int
     ): Boolean {
         if (node == null) return false
+        if (isAvatarOrProfilePhotoNode(node)) return false
+
         val txt = node.text?.toString()?.trim().orEmpty()
         val desc = node.contentDescription?.toString()?.trim().orEmpty()
         val rect = Rect()
@@ -1614,7 +1869,7 @@ class JarvisAccessibilityService : AccessibilityService() {
 
         if (rect.top >= minTop && (
                 (txt.isNotEmpty() && isPhoneticContactMatch(txt, query)) ||
-                    (desc.isNotEmpty() && isPhoneticContactMatch(desc, query))
+                    (desc.isNotEmpty() && !desc.contains("foto", ignoreCase = true) && isPhoneticContactMatch(desc, query))
                 )
         ) {
             if (clickNodeOrParent(node)) return true
@@ -1758,6 +2013,11 @@ class JarvisAccessibilityService : AccessibilityService() {
         var current = node
         var depth = 0
         while (current != null && depth < 4) {
+            if (isAvatarOrProfilePhotoNode(current)) {
+                current = current.parent
+                depth++
+                continue
+            }
             if (current.isClickable) {
                 return current.performAction(AccessibilityNodeInfo.ACTION_CLICK)
             }
@@ -1901,10 +2161,10 @@ class JarvisAccessibilityService : AccessibilityService() {
             val cleanDay = dayFilter.ifBlank { "hoy" }.lowercase().trim()
             requestedDayFilter = cleanDay
             onDayChatItemsReadyCallback = onReady
-            instance?.scrollAttemptsLeft = if (cleanDay == "hoy") 0 else 8
+            instance?.scrollAttemptsLeft = 8
             instance?.scrollDownPagesLeft = 12
             autoInspectDayChatUntilTimestamp = System.currentTimeMillis() + 18_000L
-            val delays = listOf(600L, 1100L, 1700L, 2500L, 3500L, 5000L)
+            val delays = listOf(350L, 750L, 1300L, 2000L, 3000L, 4500L)
             for (delay in delays) {
                 instance?.mainHandler?.postDelayed({
                     if (autoInspectDayChatUntilTimestamp > 0L) {
@@ -1916,7 +2176,7 @@ class JarvisAccessibilityService : AccessibilityService() {
                     }
                 }, delay)
             }
-            // Salvaguarda final a los 8000ms si no se completó antes
+            // Salvaguarda final a los 6000ms si no se completó antes
             instance?.mainHandler?.postDelayed({
                 if (autoInspectDayChatUntilTimestamp > 0L) {
                     autoInspectDayChatUntilTimestamp = 0L
@@ -1926,7 +2186,7 @@ class JarvisAccessibilityService : AccessibilityService() {
                     val items = if (root != null) instance?.extractAllVisibleChatItemsFromCurrentScreen(root).orEmpty() else emptyList()
                     cb?.invoke(items)
                 }
-            }, 8000L)
+            }, 6000L)
         }
 
         fun requestInspectBottomChatItems(onReady: (List<ScreenChatItem>) -> Unit) {
